@@ -61,6 +61,10 @@ contract StrategyBase is Initializable, IStrategy {
         _;
     }
 
+    /*******************************************************************************
+                            INITIALIZING FUNCTIONS
+    *******************************************************************************/
+
     constructor() {
         _disableInitializers();
     }
@@ -81,6 +85,9 @@ contract StrategyBase is Initializable, IStrategy {
         pauser = _pauser;
     }
 
+    /*******************************************************************************
+                            EXTERNAL FUNCTIONS
+    *******************************************************************************/
     function deposit(IERC20 weth, uint256 amount)
         external
         virtual
