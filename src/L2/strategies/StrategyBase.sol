@@ -98,13 +98,15 @@ contract StrategyBase is Initializable, IStrategy {
         require(pauser.isStrategyDeposit(), "StrategyBase:deposit paused");
 
         _beforeDeposit(weth, amount);
-
+        // 记录存款前的总份额
         uint256 priorTotalShares = totalShares;
-
+        // 计算虚拟份额总量（加上偏移量，防止除零和通胀攻击）
         uint256 virtualShareAmount = priorTotalShares + SHARES_OFFSET;
+        // 计算虚拟代币余额（当前余额已包含刚转入的 amount）
         uint256 virtualTokenBalance = ethWethBalance() + BALANCE_OFFSET;
-
+        // 计算存款前的虚拟余额（减去本次存入的金额）
         uint256 virtualPriorTokenBalance = virtualTokenBalance - amount;
+        // 新份额 = (本次质押token数量 x (计算虚拟份额总量) ÷ (计算存款前的虚拟余额)
         newShares = (amount * virtualShareAmount) / virtualPriorTokenBalance;
 
         require(newShares != 0, "StrategyBase.deposit: newShares cannot be zero");
@@ -122,7 +124,7 @@ contract StrategyBase is Initializable, IStrategy {
         require(pauser.isStrategyWithdraw(), "StrategyBase:withdraw paused");
 
         _beforeWithdrawal(weth);
-
+        //记录提款前的总份额
         uint256 priorTotalShares = totalShares;
 
         require(
@@ -133,7 +135,7 @@ contract StrategyBase is Initializable, IStrategy {
         uint256 virtualPriorTotalShares = priorTotalShares + SHARES_OFFSET;
 
         uint256 virtualTokenBalance = ethWethBalance() + BALANCE_OFFSET;
-
+        // 返还金额 = (虚拟余额 × 销毁份额) ÷ 虚拟总份额
         uint256 amountToSend = (virtualTokenBalance * amountShares) / virtualPriorTotalShares;
 
         totalShares = priorTotalShares - amountShares;

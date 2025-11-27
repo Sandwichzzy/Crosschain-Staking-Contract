@@ -28,6 +28,7 @@ interface IStrategy {
 
     function explanation() external view returns (string memory);
 
+    //==================== 新增=================
     function transferWETHToL2DappLinkBridge(
         uint256 sourceChainId,
         uint256 destChainId,
