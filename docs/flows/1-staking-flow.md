@@ -207,64 +207,80 @@ function BridgeFinalizeETHForStaking(
 
 ---
 
-#### 步骤 3: StakingManager 铸造 dETH
+#### 步骤 3: StakingManager 批量铸造 dETH
 
 **合约**: `StakingManager.sol`
-**函数**: `stake(address staker) payable`
-**文件位置**: `src/L1/core/StakingManager.sol`
+**函数**: `stake(uint256 stakeAmount, IDETH.BatchMint[] calldata batchMints) payable`
+**文件位置**: `src/L1/core/StakingManager.sol:138-157`
 
 ```solidity
-function stake(address staker) external payable whenStakingNotPaused nonReentrant {
-    // 1. 检查最小质押金额
-    if (msg.value < minimumDepositAmount) {
-        revert DepositTooSmall(msg.value, minimumDepositAmount);
+function stake(uint256 stakeAmount, IDETH.BatchMint[] calldata batchMints) external onlyDappLinkBridge payable {
+    // 1. 检查暂停状态
+    if (getL1Pauser().isStakingPaused()) {
+        revert Paused();
     }
 
-    // 2. 计算要铸造的 dETH 数量
-    uint256 dETHToMint = getDETH().ethToDETH(msg.value);
-
-    // 3. 检查 dETH 供应量上限
-    if (getDETH().totalSupply() + dETHToMint > maximumDETHSupply) {
-        revert MaximumSupplyReached();
+    // 2. 检查最小质押金额
+    if (msg.value < minimumDepositAmount || stakeAmount < minimumDepositAmount) {
+        revert MinimumDepositAmountNotSatisfied();
     }
 
-    // 4. 增加未分配的 ETH
-    unallocatedETH += msg.value;
+    // 3. 计算要铸造的 dETH 数量
+    uint256 dETHMintAmount = ethToDETH(stakeAmount);
 
-    // 5. 铸造 dETH 给质押者
-    getDETH().mint(staker, dETHToMint);
+    // 4. 检查 dETH 供应量上限
+    if (dETHMintAmount + getDETH().totalSupply() > maximumDETHSupply) {
+        revert MaximumDETHSupplyExceeded();
+    }
 
-    // 6. 触发事件
-    emit Staked(staker, msg.value, dETHToMint);
+    // 5. 增加未分配的 ETH
+    unallocatedETH += stakeAmount;
+
+    // 6. ⭐ 批量铸造 dETH 给多个接收者
+    getDETH().batchMint(batchMints);
+
+    // 7. 触发事件
+    emit Staked(getLocator().dapplinkBridge(), stakeAmount, dETHMintAmount);
+}
+```
+
+**BatchMint 结构体**:
+```solidity
+// DETH.sol
+struct BatchMint {
+    address recipient;  // dETH 接收者地址
+    uint256 amount;     // 铸造的 dETH 数量
 }
 ```
 
 **状态变化**:
-- `StakingManager.unallocatedETH` 增加 `msg.value`
-- `DETH.totalSupply` 增加 `dETHToMint`
-- `DETH.balances[staker]` 增加 `dETHToMint`
+- `StakingManager.unallocatedETH` 增加 `stakeAmount`
+- `DETH.totalSupply` 增加 `dETHMintAmount`
+- `DETH.balances[recipient]` 根据 `batchMints` 数组批量增加
 
 **关键计算 - dETH 数量**:
 ```solidity
-// DETH.sol: ethToDETH()
-function ethToDETH(uint256 ethAmount) public view returns (uint256) {
-    uint256 totalControlledETH = getTotalControlledETH();  // 协议总控制 ETH
-    uint256 supply = totalSupply();                        // dETH 总供应量
-
-    if (supply == 0) {
+// StakingManager.sol: ethToDETH()
+function ethToDETH(uint256 ethAmount) public returns (uint256) {
+    if (getDETH().totalSupply() == 0) {
         return ethAmount;  // 初始汇率 1:1
     }
-
-    // dETH 数量 = ethAmount * (supply / totalControlledETH)
-    return (ethAmount * supply) / totalControlledETH;
+    // dETH 数量 = ethAmount * totalSupply / totalControlled
+    return Math.mulDiv(ethAmount, getDETH().totalSupply(), totalControlled());
 }
 ```
 
+**关键差异**:
+- ⭐ **仅限桥接调用**: 使用 `onlyDappLinkBridge` 修饰符,不是公开函数
+- ⭐ **批量铸造**: 支持一次性给多个地址铸造 dETH
+- ⭐ **两个金额参数**: `msg.value` 和 `stakeAmount` 都需要检查
+- ⭐ **事件发送者**: emit 事件时使用 bridge 地址而非 staker
+
 **安全检查**:
-- ✅ 最小质押金额检查 (`minimumDepositAmount`,默认 32 ETH)
-- ✅ 最大供应量检查 (`maximumDETHSupply`,默认 1024 ETH)
-- ✅ 重入保护 (`nonReentrant`)
-- ✅ 暂停检查 (`whenStakingNotPaused`)
+- ✅ 最小质押金额检查 (`minimumDepositAmount`)
+- ✅ 最大供应量检查 (`maximumDETHSupply`)
+- ✅ 暂停检查 (`isStakingPaused()`)
+- ✅ 权限检查 (`onlyDappLinkBridge`)
 
 ---
 
@@ -273,101 +289,80 @@ function ethToDETH(uint256 ethAmount) public view returns (uint256) {
 #### 步骤 4: 用户转移 dETH 触发跨链消息
 
 **合约**: `DETH.sol`
-**函数**: `transfer(address to, uint256 amount)`
-**文件位置**: `src/L1/core/DETH.sol`
+**函数**: `transfer(address to, uint256 value)`
+**文件位置**: `src/L1/core/DETH.sol:103-116`
 
 ```solidity
-function transfer(address to, uint256 amount) public override returns (bool) {
-    // 调用父合约的 transfer
-    bool success = super.transfer(to, amount);
+function transfer(address to, uint256 value) override(ERC20Upgradeable, IERC20) public returns (bool) {
+    address owner = _msgSender();
 
-    if (success) {
-        // 转账成功后,发送跨链消息到 L2
-        _sendMessageToL2Bridge(msg.sender, amount, to);
+    // 1. 执行 ERC20 转账
+    _transfer(owner, to, value);
+
+    // 2. ⭐ 通过 SafeCall 发送跨链质押消息
+    bool success = SafeCall.callWithMinGas(
+        bridgeAddress,
+        200000,  // gas limit
+        0,       // value (不发送 ETH)
+        abi.encodeWithSignature("BridgeInitiateStakingMessage(address,address,uint256)", owner, to, value)
+    );
+
+    if (!success) {
+        revert BridgeStakingMessageInitFailed();
     }
-
-    return success;
-}
-
-function _sendMessageToL2Bridge(
-    address staker,
-    uint256 amount,
-    address l2Recipient
-) internal {
-    // 调用 L1 TokenBridge 发起跨链消息
-    ITokenBridgeBase(getLocator().dapplinkBridge()).BridgeInitiateStakingMessage(
-        staker,
-        amount,
-        l2Recipient,
-        l2Strategy,  // L2 策略地址
-        sourceChainId,
-        destChainId
-    );
-}
-```
-
-**状态变化**:
-- `DETH.balances[user]` 减少 `amount`
-- `DETH.balances[to]` 增加 `amount`
-- 触发跨链消息
-
-**注意事项**:
-- ⚠️ 每次 dETH 转账都会触发跨链消息
-- ⚠️ 转账目标地址 `to` 通常是用户在 L2 的地址
-- ⚠️ 需要 Relayer 中继消息才能在 L2 生效
-
----
-
-#### 步骤 5: L1 桥接合约发起消息
-
-**合约**: `TokenBridgeBase.sol`
-**函数**: `BridgeInitiateStakingMessage(...)`
-**文件位置**: `src/bridge/core/bridge/TokenBridgeBase.sol`
-
-```solidity
-function BridgeInitiateStakingMessage(
-    address staker,
-    uint256 shares,
-    address l2Recipient,
-    address l2Strategy,
-    uint256 sourceChainId,
-    uint256 destChainId
-) external returns (bool) {
-    // 1. 构造消息
-    bytes memory message = abi.encode(
-        staker,
-        shares,
-        l2Recipient,
-        l2Strategy
-    );
-
-    // 2. 发送消息到 MessageManager
-    getMessageManager().sendMessage(
-        destChainId,
-        address(this),  // target: L2 TokenBridge
-        message
-    );
-
-    // 3. 触发事件
-    emit BridgeInitiated(staker, shares, l2Strategy);
 
     return true;
 }
 ```
 
-**消息内容**:
+**关键特性**:
+- ⭐ **直接调用桥接**: 使用 `SafeCall.callWithMinGas()` 而非内部函数
+- ⭐ **3 个参数**: `BridgeInitiateStakingMessage(address from, address to, uint256 shares)`
+- ⭐ **包含 from 地址**: 与之前文档描述不同,实际包含转出地址
+- ⭐ **Gas 限制**: 固定 200000 gas
+- ⭐ **失败回滚**: 如果桥接消息发送失败,整个转账回滚
+
+**TokenBridge.BridgeInitiateStakingMessage()** (TokenBridgeBase.sol:274-291):
 ```solidity
-struct StakingMessage {
-    address staker;        // 质押者地址
-    uint256 shares;        // dETH 数量(将转换为份额)
-    address l2Recipient;   // L2 接收者地址
-    address l2Strategy;    // L2 策略地址
+function BridgeInitiateStakingMessage(
+    address from,
+    address to,
+    uint256 shares
+) external returns (bool) {
+    // 生成质押消息哈希
+    bytes32 stakingMessageHash = keccak256(
+        abi.encode(from, to, shares, stakingMessageNumber)
+    );
+
+    // 触发事件供 Relayer 监听
+    emit InitiateStakingMessage(
+        from,
+        to,
+        shares,
+        stakingMessageNumber,
+        stakingMessageHash
+    );
+
+    stakingMessageNumber++;
+    return true;
 }
 ```
 
+**状态变化**:
+- `DETH.balances[owner]` 减少 `value`
+- `DETH.balances[to]` 增加 `value`
+- 生成跨链消息哈希
+- `stakingMessageNumber` 递增
+
+**注意事项**:
+- ⚠️ 每次 dETH 转账都会触发跨链消息
+- ⚠️ 转账目标地址 `to` 通常是用户在 L2 的地址
+- ⚠️ 需要 Relayer 中继消息才能在 L2 生效
+- ⭐ **不发送实际 ETH**: 只发送消息,ETH 已在 StakingManager 中
+
 ---
 
-#### 步骤 6: Relayer 中继消息到 L2
+#### 步骤 5: Relayer 中继消息到 L2
 
 **操作者**: Relayer (链下服务)
 **流程**:
@@ -375,7 +370,7 @@ struct StakingMessage {
 1. **监听 L1 事件**:
 ```javascript
 // Relayer 伪代码
-l1Bridge.on('BridgeInitiated', async (staker, shares, strategy, event) => {
+l1Bridge.on('InitiateStakingMessage', async (from, to, shares, nonce, messageHash) => {
     const messageHash = event.transactionHash;
     const proof = await generateProof(event);
 
@@ -384,84 +379,158 @@ l1Bridge.on('BridgeInitiated', async (staker, shares, strategy, event) => {
 });
 ```
 
-2. **在 L2 申领消息**:
-```solidity
-// Relayer 调用 L2Bridge.claimMessage()
-l2Bridge.claimMessage(messageHash, proof);
+2. **在 L2 完成份额转移**:
+```javascript
+// Relayer 调用 L2Bridge.BridgeFinalizeStakingMessage()
+await l2Bridge.BridgeFinalizeStakingMessage(
+    shareAddress,  // Strategy 合约地址
+    from,
+    to,
+    shares,
+    nonce,
+    gasLimit
+);
 ```
 
 ---
 
-#### 步骤 7: L2 桥接合约验证并最终化
+#### 步骤 6: L2 桥接合约调用 Strategy 转移份额
 
 **合约**: `TokenBridgeBase.sol` (L2 实例)
-**函数**: `BridgeFinalizeStakingMessage(...)`
+**函数**: `BridgeFinalizeStakingMessage(address shareAddress, address from, address to, uint256 shares, uint256 stakeMessageNonce, uint256 gasLimit)`
+**文件位置**: `src/bridge/core/bridge/TokenBridgeBase.sol:442-478`
 
 ```solidity
 function BridgeFinalizeStakingMessage(
-    address staker,
+    address shareAddress,  // Strategy 合约地址
+    address from,
+    address to,
     uint256 shares,
-    address l2Recipient,
-    address l2Strategy
-) external {
-    // 1. 验证调用来自 MessageManager
-    require(msg.sender == address(messageManager), "Unauthorized");
+    uint256 stakeMessageNonce,
+    uint256 gasLimit
+) external returns (bool) {
+    // 1. 验证消息哈希
+    bytes32 stakingMessageHash = keccak256(
+        abi.encode(from, to, shares, stakeMessageNonce)
+    );
 
-    // 2. 调用 StrategyManager 存入策略
-    IStrategyManager(strategyManager).depositIntoStrategyForStaking(
-        l2Recipient,
-        l2Strategy,
-        shares
+    // 2. ⭐ 通过 SafeCall 调用 Strategy.TransferShareTo()
+    bool success = SafeCall.callWithMinGas(
+        shareAddress,
+        gasLimit,
+        0,
+        abi.encodeWithSignature(
+            "TransferShareTo(address,address,uint256,uint256)",
+            from,
+            to,
+            shares,
+            stakeMessageNonce
+        )
+    );
+
+    require(
+        success,
+        "TokenBridge.BridgeFinalizeStakingMessage: call failed"
     );
 
     // 3. 触发事件
-    emit BridgeFinalized(staker, shares, l2Strategy);
+    emit FinalizeStakingMessage(
+        from,
+        to,
+        shareAddress,
+        shares,
+        stakeMessageNonce,
+        stakingMessageHash
+    );
+
+    return true;
 }
 ```
 
+**关键特性**:
+- ⭐ **直接调用 Strategy**: 不经过 StrategyManager
+- ⭐ **消息哈希验证**: 在 Strategy 内部验证
+- ⭐ **防重放**: 使用 `stakeMessageNonce` 确保唯一性
+
 ---
 
-#### 步骤 8: StrategyManager 更新用户份额
+#### 步骤 7: Strategy 转移份额
 
-**合约**: `StrategyManager.sol`
-**函数**: `depositIntoStrategyForStaking(address staker, address strategy, uint256 amount)`
-**文件位置**: `src/L2/core/StrategyManager.sol`
+**合约**: `StrategyBase.sol`
+**函数**: `TransferShareTo(address from, address to, uint256 shares, uint256 stakeNonce)`
+**文件位置**: `src/L2/strategies/StrategyBase.sol:315-320`
 
 ```solidity
-function depositIntoStrategyForStaking(
-    address staker,
-    address strategy,
-    uint256 amount
-) external onlyBridge whenNotPaused returns (uint256 shares) {
-    // 1. 调用 Strategy 存入资产
-    shares = IStrategy(strategy).deposit(staker, amount);
+function TransferShareTo(address from, address to, uint256 shares, uint256 stakeNonce) external {
+    // 1. 重新计算消息哈希进行验证
+    bytes32 sakeMessageHash = keccak256(abi.encode(from, to, shares, stakeNonce));
 
-    // 2. 更新用户在该策略中的份额
-    stakerStrategyShares[staker][strategy] += shares;
-
-    // 3. 如果是新策略,添加到用户策略列表
-    if (!_hasStrategy(staker, strategy)) {
-        stakerStrategyList[staker].push(strategy);
+    // 2. ⭐ 验证哈希匹配(防止重复执行)
+    if (sakeMessageHash == stakeMessageHashRelate[stakeNonce]) {
+        // 3. 调用 StrategyManager 转移份额
+        strategyManager.transferStakerStrategyShares(address(this), from, to, shares);
     }
+}
+```
 
-    // 4. 触发事件
-    emit Deposit(staker, strategy, shares);
-
-    return shares;
+**StrategyManager.transferStakerStrategyShares()** (StrategyManager.sol:531-535):
+```solidity
+function transferStakerStrategyShares(address strategy, address from, address to, uint256 shares) external returns (bool) {
+    stakerStrategyShares[from][strategy] -= shares;
+    stakerStrategyShares[to][strategy] += shares;
+    return true;
 }
 ```
 
 **状态变化**:
-- `Strategy.totalShares` 增加 `shares`
-- `Strategy.shares[staker]` 增加 `shares`
-- `StrategyManager.stakerStrategyShares[staker][strategy]` 增加 `shares`
-- 如果是新策略,添加到 `stakerStrategyList[staker][]`
+- `stakerStrategyShares[from][strategy]` 减少 `shares`
+- `stakerStrategyShares[to][strategy]` 增加 `shares`
+- **⭐ 不改变 totalShares**: 只是份额所有权转移
 
-**份额计算** (在 Strategy 内部):
+**重要注意**:
+- ⭐ **防止套娃**: 注释中提到"防止重复套娃",确保 L1 的 dETH 转账不会在 L2 重复触发转账
+- ⭐ **哈希预存储**: Relayer 需要先调用 `updateStakeMessageHash()` 存储消息哈希
+- ⭐ **验证后才执行**: 只有消息哈希匹配时才转移份额
+
+---
+
+#### 步骤 8: Relayer 更新消息哈希映射
+
+**合约**: `StrategyBase.sol`
+**函数**: `updateStakeMessageHash(uint256 stakeMessageNonce, bytes32 stakeMsgHash)`
+**文件位置**: `src/L2/strategies/StrategyBase.sol:309-312`
+
 ```solidity
-// Strategy.sol: deposit()
-function deposit(address staker, uint256 amount) external returns (uint256 shares) {
-    uint256 priorTotalShares = totalShares;
+function updateStakeMessageHash(uint256 stakeMessageNonce, bytes32 stakeMsgHash) external onlyRelayer {
+    stakeMessageHashRelate[stakeMessageNonce] = stakeMsgHash;
+    emit StakeMessageHashRelate(stakeMessageNonce, stakeMsgHash);
+}
+```
+
+**Relayer 工作流程**:
+```javascript
+// 1. 监听 L1 事件
+l1Bridge.on('InitiateStakingMessage', async (from, to, shares, nonce, messageHash) => {
+    // 2. 先在 Strategy 中存储消息哈希
+    await l2Strategy.updateStakeMessageHash(nonce, messageHash);
+
+    // 3. 然后调用桥接完成份额转移
+    await l2Bridge.BridgeFinalizeStakingMessage(
+        l2Strategy,
+        from,
+        to,
+        shares,
+        nonce,
+        gasLimit
+    );
+});
+```
+
+---
+
+### 阶段 3: L2 策略委托 (可选)
+
+#### 步骤 9: 用户委托给运营商
     uint256 priorBalance = underlyingToken.balanceOf(address(this));
 
     if (priorTotalShares == 0) {

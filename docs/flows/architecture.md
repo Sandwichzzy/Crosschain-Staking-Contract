@@ -188,9 +188,9 @@ graph LR
 
 | 合约 | 主要职责 | 核心状态变量 |
 |------|----------|-------------|
-| **StakingManager** | ETH汇聚、dETH铸造/销毁、验证者启动 | `totalDepositedInValidators`<br/>`numInitiatedValidators`<br/>`unallocatedETH` |
+| **StakingManager** | ETH汇聚、dETH铸造/销毁、验证者启动 | `totalDepositedInValidators`<br/>`numInitiatedValidators`<br/>`unallocatedETH`<br/>`allocatedETHForDeposits`<br/>`unStakeMessageNonce` |
 | **DETH** | 质押凭证代币、转账触发跨链 | `totalSupply`<br/>`balances`<br/>`dETHToETH` 汇率 |
-| **UnstakeRequestsManager** | 解质押请求队列、申领管理 | `requests[]`<br/>`nextRequestId`<br/>`unallocatedETH` |
+| **UnstakeRequestsManager** | 解质押请求队列、申领管理 | `l2ChainStrategyAmount`<br/>`dEthLockedAmount`<br/>`l2ChainStrategyBlockNumber`<br/>`allocatedETHForClaims`<br/>`latestCumulativeETHRequested` |
 | **OracleManager** | 验证者状态验证、记录管理 | `_records[]`<br/>`hasPendingUpdate`<br/>`finalizationBlockNumberDelta` |
 | **ReturnsAggregator** | 收益分类处理、费用收取 | `feesBasisPoints`<br/>`protocolFeesAccrued` |
 | **ReturnsReceiver** | 接收验证者提款 | (无状态,纯接收) |
@@ -273,9 +273,9 @@ graph TB
 
 | 合约 | 主要职责 | 核心状态变量 |
 |------|----------|-------------|
-| **StrategyManager** | 管理用户在各策略中的份额 | `stakerStrategyShares[staker][strategy]`<br/>`stakerStrategyList[staker][]` |
-| **DelegationManager** | 管理委托关系、运营商份额、提款队列 | `delegatedTo[staker]`<br/>`operatorShares[operator][strategy]`<br/>`cumulativeWithdrawalsQueued[staker]` |
-| **Strategy** | 具体策略实现(ETH/WETH/ERC20) | `totalShares`<br/>`shares[user]`<br/>`underlyingToken` |
+| **StrategyManager** | 管理用户在各策略中的份额 | `stakerStrategyShares[staker][strategy]`<br/>`stakerStrategyL1BackShares[staker][strategy]`<br/>`stakerStrategyList[staker][]` |
+| **DelegationManager** | 管理委托关系、运营商份额、提款队列 | `delegatedTo[staker]`<br/>`operatorShares[operator][strategy]`<br/>`cumulativeWithdrawalsQueued[staker]`<br/>`pendingWithdrawals[withdrawalRoot]` |
+| **Strategy** | 具体策略实现(ETH/WETH/ERC20) | `totalShares`<br/>`shares[user]`<br/>`underlyingToken`<br/>`virtualEthBalance`<br/>`virtualWethBalance` |
 | **L1RewardManager** | 分配L1桥接来的ETH奖励 | `L1RewardBalance`<br/>按份额比例分配 |
 | **L2RewardManager** | 分配L2 DappLink代币奖励 | `stakerRewards[strategy]`<br/>`operatorRewards[operator]`<br/>`stakerPercent=92%` |
 | **L2PoolManager** | 接收L2存款、触发L2→L1桥接 | 资金池余额 |
@@ -335,26 +335,45 @@ sequenceDiagram
 
 ```solidity
 // L1 → L2 ETH 桥接
-function BridgeInitiateETH(address to, uint256 amount) external payable;
-function BridgeFinalizeETH(address to, uint256 amount) external;
+function BridgeInitiateETH(
+    uint256 sourceChainId,
+    uint256 destChainId,
+    address to
+) external payable returns (bool);
+
+function BridgeFinalizeETH(
+    uint256 sourceChainId,
+    uint256 destChainId,
+    address to,
+    uint256 amount,
+    uint256 _fee,
+    uint256 _nonce
+) external payable onlyRole(ReLayer) returns (bool);
 
 // L1 → L2 质押消息
 function BridgeInitiateStakingMessage(
-    address staker,
-    uint256 shares,
-    address strategy
-) external;
+    address from,      // dETH 转出地址
+    address to,        // dETH 接收地址
+    uint256 shares     // 转移的份额数量
+) external returns (bool);
 
 function BridgeFinalizeStakingMessage(
-    address staker,
+    address shareAddress,      // Strategy 合约地址
+    address from,
+    address to,
     uint256 shares,
-    address strategy
-) external;
+    uint256 stakeMessageNonce,
+    uint256 gasLimit
+) external returns (bool);
 
 // 消息验证和申领
 function claimMessage(
-    bytes32 messageHash,
-    bytes memory proof
+    uint256 sourceChainId,
+    uint256 destChainId,
+    address to,
+    uint256 _fee,
+    uint256 _value,
+    uint256 _nonce
 ) external;
 ```
 
@@ -602,16 +621,14 @@ struct Config {
 
 ```solidity
 struct Config {
+    address delegation;                  // 委托管理 (DelegationManager)
     address strategyManager;             // 策略管理
-    address delegationManager;           // 委托管理
+    address dapplinkToken;               // DappLink 代币
+    address pauser;                      // L2 暂停器
+    address slasher;                     // Slasher 合约
+    address relayer;                     // Relayer 地址
     address l1RewardManager;             // L1 奖励管理
     address l2RewardManager;             // L2 奖励管理
-    address l2PoolManager;               // L2 资金池
-    address pauser;                      // L2 暂停器
-    address dapplinkBridge;              // 桥接合约
-    address dapplinkToken;               // DappLink 代币
-    address relayerAddress;              // Relayer 地址
-    address weth;                        // WETH 代币
 }
 ```
 
