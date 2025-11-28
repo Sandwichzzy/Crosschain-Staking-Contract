@@ -72,6 +72,7 @@ contract DETH is L1Base, ERC20PermitUpgradeable, IDETH {
         return ERC20PermitUpgradeable.nonces(owner);
     }
 
+    //重写transfer，将二层的 shares 也要转移给别人，防止重复套娃
     function transfer(address to, uint256 value) override(ERC20Upgradeable, IERC20) pulic returns (bool) {
         address owner = _msgSender();
         _transfer(owner, to, value);

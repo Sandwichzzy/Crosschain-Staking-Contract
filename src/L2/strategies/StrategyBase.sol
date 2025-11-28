@@ -224,6 +224,7 @@ contract StrategyBase is Initializable, IStrategy {
         return virtualWethBalance;
     }
 
+    //链下relayer监听质押的合约事件调用
     function transferETHToL2DappLinkBridge(
         uint256 sourceChainId,
         uint256 destChainId,
@@ -235,6 +236,7 @@ contract StrategyBase is Initializable, IStrategy {
         if (address(this).balance > 32e18) {
             uint256 amountBridge = ((address(this).balance) / 32e18) * 32e18;
             nextNonce++;
+            //调用bridge合约BridgeInitiateETH，将资金转移到L1层
             bool success = SafeCall.callWithMinGas(
                 bridge,
                 gasLimit,
@@ -309,6 +311,7 @@ contract StrategyBase is Initializable, IStrategy {
         emit StakeMessageHashRelate(stakeMessageNonce, stakeMsgHash);
     }
 
+    //防止重复套娃：当发生L1发生A转dETH给B时 dETH=> 会调用桥合约BridgeInitiateStakingMessage  BridgeFinalizeStakingMessage=>TransferShareTo（a to B）
     function TransferShareTo(address from, address to, uint256 shares, uint256 stakeNonce) external {
         bytes32 sakeMessageHash = keccak256(abi.encode(from, to, shares, stakeNonce));
         if (sakeMessageHash == stakeMessageHashRelate[stakeNonce]) {

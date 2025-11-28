@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 import "@openzeppelin-upgrades/contracts/proxy/utils/Initializable.sol";
 import "@openzeppelin-upgrades/contracts/access/extensions/AccessControlEnumerableUpgradeable.sol";
-import "@openzeppelin-upgrades/contracts/utils/ReentrancyGuardUpgradeable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "../interfaces/IL1Locator.sol";
 import {ProtocolEvents} from "../interfaces/ProtocolEvents.sol";
 import {IL1Pauser} from "../../access/interface/IL1Pauser.sol";
@@ -16,7 +16,7 @@ import {IDepositContract} from "../interfaces/IDepositContract.sol";
 abstract contract L1Base is
     Initializable,
     AccessControlEnumerableUpgradeable,
-    ReentrancyGuardUpgradeable,
+    ReentrancyGuard,
     ProtocolEvents
 {
     address public locator;
