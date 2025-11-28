@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.0;
 
-import {Initializable} from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
-import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/utils/PausableUpgradeable.sol";
-import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
+import {Initializable} from "@openzeppelin-upgrades/contracts/proxy/utils/Initializable.sol";
+import "@openzeppelin-upgrades/contracts/access/AccessControlUpgradeable.sol";
+import "@openzeppelin-upgrades/contracts/utils/PausableUpgradeable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
@@ -16,7 +16,7 @@ import "../../interfaces/WETH.sol";
 abstract contract TokenBridgeBase is
     Initializable,
     AccessControlUpgradeable,
-    ReentrancyGuardUpgradeable
+    ReentrancyGuard
 {
     bytes32 public constant ReLayer =
     keccak256(abi.encode(uint256(keccak256("ReLayer")) - 1)) &
@@ -126,6 +126,9 @@ abstract contract TokenBridgeBase is
 
     error TransferETHFailed();
 
+    /// @notice 初始化 TokenBridge 基础合约
+    /// @param _MultisigWallet 多签钱包地址,将被授予管理员角色
+    /// @param _messageManager 消息管理器合约地址,用于跨链消息传递
     function __TokenBridge_init(
         address _MultisigWallet,
         address _messageManager
@@ -137,6 +140,12 @@ abstract contract TokenBridgeBase is
         stakingMessageNumber = 1;
     }
 
+    /// @notice 发起 ETH 的跨链转账
+    /// @dev 用户在源链调用此函数,发送 ETH 到目标链
+    /// @param sourceChainId 源链 ID,必须与当前链 ID 一致
+    /// @param destChainId 目标链 ID,必须在支持的链列表中
+    /// @param to 目标链上的接收地址
+    /// @return 是否成功发起跨链转账
     function BridgeInitiateETH(
         uint256 sourceChainId,
         uint256 destChainId,
@@ -163,6 +172,13 @@ abstract contract TokenBridgeBase is
         return true;
     }
 
+    /// @notice 发起 WETH 的跨链转账
+    /// @dev 从用户账户转移 WETH 到本合约,然后通过 MessageManager 发送跨链消息
+    /// @param sourceChainId 源链 ID,必须与当前链 ID 一致
+    /// @param destChainId 目标链 ID,不能与源链相同
+    /// @param to 目标链上的接收地址
+    /// @param value 转账的 WETH 数量
+    /// @return 是否成功发起跨链转账
     function BridgeInitiateWETH(
         uint256 sourceChainId,
         uint256 destChainId,
@@ -201,6 +217,14 @@ abstract contract TokenBridgeBase is
         return true;
     }
 
+    /// @notice 发起 ERC20 代币的跨链转账
+    /// @dev 从用户账户转移 ERC20 到本合约,扣除手续费后通过 MessageManager 发送跨链消息
+    /// @param sourceChainId 源链 ID,必须与当前链 ID 一致
+    /// @param destChainId 目标链 ID,必须在支持的链列表中
+    /// @param to 目标链上的接收地址
+    /// @param ERC20Address ERC20 代币合约地址,必须在支持的代币列表中
+    /// @param value 转账的代币数量
+    /// @return 是否成功发起跨链转账
     function BridgeInitiateERC20(
         uint256 sourceChainId,
         uint256 destChainId,
@@ -241,6 +265,12 @@ abstract contract TokenBridgeBase is
         return true;
     }
 
+    /// @notice 发起质押消息的跨链传递
+    /// @dev 生成质押消息哈希并发出事件,用于跨链质押份额的转移
+    /// @param from 份额的原始持有者地址
+    /// @param to 份额的目标接收者地址
+    /// @param shares 转移的份额数量
+    /// @return 是否成功发起质押消息
     function BridgeInitiateStakingMessage(
         address from,
         address to,
@@ -260,6 +290,15 @@ abstract contract TokenBridgeBase is
         return true;
     }
 
+    /// @notice 在目标链完成 ETH 的跨链接收
+    /// @dev 由 Relayer 调用,验证跨链消息后将 ETH 转给接收者
+    /// @param sourceChainId 源链 ID,必须在支持的链列表中
+    /// @param destChainId 目标链 ID,必须与当前链 ID 一致
+    /// @param to 接收者地址
+    /// @param amount 接收的 ETH 数量(已扣除手续费)
+    /// @param _fee 手续费金额
+    /// @param _nonce 消息序号,用于防止重放攻击
+    /// @return 是否成功完成跨链接收
     function BridgeFinalizeETH(
         uint256 sourceChainId,
         uint256 destChainId,
@@ -293,6 +332,15 @@ abstract contract TokenBridgeBase is
         return true;
     }
 
+    /// @notice 在目标链完成 WETH 的跨链接收
+    /// @dev 由 Relayer 调用,验证跨链消息后将 WETH 转给接收者
+    /// @param sourceChainId 源链 ID,必须在支持的链列表中
+    /// @param destChainId 目标链 ID,必须与当前链 ID 一致
+    /// @param to 接收者地址
+    /// @param amount 接收的 WETH 数量(已扣除手续费)
+    /// @param _fee 手续费金额
+    /// @param _nonce 消息序号,用于防止重放攻击
+    /// @return 是否成功完成跨链接收
     function BridgeFinalizeWETH(
         uint256 sourceChainId,
         uint256 destChainId,
@@ -331,6 +379,16 @@ abstract contract TokenBridgeBase is
         return true;
     }
 
+    /// @notice 在目标链完成 ERC20 代币的跨链接收
+    /// @dev 由 Relayer 调用,验证跨链消息后将 ERC20 代币转给接收者
+    /// @param sourceChainId 源链 ID,必须在支持的链列表中
+    /// @param destChainId 目标链 ID,必须与当前链 ID 一致
+    /// @param to 接收者地址
+    /// @param ERC20Address ERC20 代币合约地址,必须在支持的代币列表中
+    /// @param amount 接收的代币数量(已扣除手续费)
+    /// @param _fee 手续费金额
+    /// @param _nonce 消息序号,用于防止重放攻击
+    /// @return 是否成功完成跨链接收
     function BridgeFinalizeERC20(
         uint256 sourceChainId,
         uint256 destChainId,
@@ -372,6 +430,15 @@ abstract contract TokenBridgeBase is
         return true;
     }
 
+    /// @notice 在目标链完成质押份额的跨链转移
+    /// @dev 通过安全调用目标合约的 TransferShareTo 函数来转移质押份额
+    /// @param shareAddress 份额管理合约地址
+    /// @param from 份额的原始持有者地址
+    /// @param to 份额的目标接收者地址
+    /// @param shares 转移的份额数量
+    /// @param stakeMessageNonce 质押消息序号
+    /// @param gasLimit 调用的 gas 限制
+    /// @return 是否成功完成份额转移
     function BridgeFinalizeStakingMessage(
         address shareAddress,
         address from,
@@ -410,30 +477,24 @@ abstract contract TokenBridgeBase is
         return true;
     }
 
+    /// @notice 检查给定的链 ID 是否在支持的链列表中
+    /// @param chainId 要检查的链 ID
+    /// @return 是否支持该链
     function IsSupportChainId(uint256 chainId) public view returns (bool) {
         return IsSupportedChainId[chainId];
     }
 
+    /// @notice 根据当前链 ID 返回对应的 WETH 合约地址
+    /// @dev 支持 Scroll、Arbitrum、Base 等多条链
+    /// @return WETH 合约地址
     function L2WETH() public view returns (address) {
         uint256 Blockchain = block.chainid;
         if (Blockchain == 0x82750) {
             // Scroll: https://chainlist.org/chain/534352
             return (ContractsAddress.ScrollWETH);
-        } else if (Blockchain == 0x44d) {
-            // Polygon zkEVM https://chainlist.org/chain/1101
-            return (ContractsAddress.PolygonZkEVMWETH);
-        } else if (Blockchain == 0xa) {
-            // OP Mainnet https://chainlist.org/chain/10
-            return (ContractsAddress.OptimismWETH);
         } else if (Blockchain == 0xa4b1) {
             // Arbitrum One https://chainlist.org/chain/42161
             return (ContractsAddress.ArbitrumOneWETH);
-        } else if (Blockchain == 0xa4ba) {
-            // Arbitrum Nova https://chainlist.org/chain/42170
-            return (ContractsAddress.ArbitrumNovaWETH);
-        } else if (Blockchain == 0x144) {
-            //ZkSync Mainnet https://chainlist.org/chain/324
-            return (ContractsAddress.ZkSyncWETH);
         } else if (Blockchain == 0x1388) {
             //Mantle https://chainlist.org/chain/5000
             revert MantleNotWETH();
@@ -448,6 +509,11 @@ abstract contract TokenBridgeBase is
         }
     }
 
+    /// @notice 快速向用户发送资产,由 Relayer 调用
+    /// @dev 这是 SendAssertToUser 的外部可调用版本
+    /// @param _token 代币地址(ETH 使用 ETHAddress)
+    /// @param to 接收者地址
+    /// @param _amount 发送数量
     function QuickSendAssertToUser(
         address _token,
         address to,
@@ -456,6 +522,12 @@ abstract contract TokenBridgeBase is
         SendAssertToUser(_token, to, _amount);
     }
 
+    /// @notice 内部函数:向用户发送资产(ETH 或 ERC20)
+    /// @dev 从 FundingPoolBalance 中扣除并转账给用户
+    /// @param _token 代币地址(ETH 使用 ETHAddress)
+    /// @param to 接收者地址
+    /// @param _amount 发送数量
+    /// @return 是否成功发送
     function SendAssertToUser(
         address _token,
         address to,
@@ -483,12 +555,17 @@ abstract contract TokenBridgeBase is
         return true;
     }
 
+    /// @notice 设置最小转账金额
+    /// @param _MinTransferAmount 最小转账金额(wei)
     function setMinTransferAmount(
         uint256 _MinTransferAmount
     ) external onlyRole(ReLayer) {
         MinTransferAmount = _MinTransferAmount;
     }
 
+    /// @notice 设置链是否被支持
+    /// @param chainId 链 ID
+    /// @param isValid 是否支持该链
     function setValidChainId(
         uint256 chainId,
         bool isValid
@@ -496,6 +573,9 @@ abstract contract TokenBridgeBase is
         IsSupportedChainId[chainId] = isValid;
     }
 
+    /// @notice 设置是否支持某个 ERC20 代币
+    /// @param ERC20Address ERC20 代币合约地址
+    /// @param isValid 是否支持该代币
     function setSupportERC20Token(
         address ERC20Address,
         bool isValid
@@ -506,11 +586,16 @@ abstract contract TokenBridgeBase is
         }
     }
 
+    /// @notice 设置跨链转账手续费比例
+    /// @param _PerFee 手续费比例(基点,例如 10000 = 1%)
     function setPerFee(uint256 _PerFee) external onlyRole(DEFAULT_ADMIN_ROLE) {
         require(_PerFee<1_000_000);
         PerFee = _PerFee;
     }
 
+    /// @notice 设置资金池余额(仅限紧急情况)
+    /// @param token 代币地址
+    /// @param amount 余额数量
     function setFundingPoolBalance(
         address token,
         uint256 amount

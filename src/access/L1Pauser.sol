@@ -8,8 +8,10 @@ import {
 import {AccessControlEnumerable} from "@openzeppelin/contracts/access/extensions/AccessControlEnumerable.sol";
 
 import {IOracleManager} from "../L1/interfaces/IOracleManager.sol";
+import "./interface/IL1Pauser.sol";
 
-contract L1Pauser is Initializable, AccessControlEnumerableUpgradeable, L1PauserStorage {
+contract L1Pauser is Initializable, AccessControlEnumerableUpgradeable, IL1Pauser{
+
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
 
     bytes32 public constant UNPAUSER_ROLE = keccak256("UNPAUSER_ROLE");

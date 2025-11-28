@@ -164,15 +164,6 @@ contract StrategyManager is
     }
 
 
-    function migrateQueuedWithdrawal(DeprecatedStruct_QueuedWithdrawal memory queuedWithdrawal) external onlyDelegationManager returns(bool, bytes32) {
-        bytes32 existingWithdrawalRoot = calculateWithdrawalRoot(queuedWithdrawal);
-        bool isDeleted;
-        if (withdrawalRootPending[existingWithdrawalRoot]) {
-            withdrawalRootPending[existingWithdrawalRoot] = false;
-            isDeleted = true;
-        }
-        return (isDeleted, existingWithdrawalRoot);
-    }
 
     function setThirdPartyTransfersForbidden(
         address strategy,
@@ -361,20 +352,6 @@ contract StrategyManager is
         return keccak256(abi.encode(DOMAIN_TYPEHASH, keccak256(bytes("DappLink")), block.chainid, address(this)));
     }
 
-    function calculateWithdrawalRoot(DeprecatedStruct_QueuedWithdrawal memory queuedWithdrawal) public pure returns (bytes32) {
-        return (
-            keccak256(
-            abi.encode(
-                queuedWithdrawal.strategies,
-                queuedWithdrawal.shares,
-                queuedWithdrawal.staker,
-                queuedWithdrawal.withdrawerAndNonce,
-                queuedWithdrawal.withdrawalStartBlock,
-                queuedWithdrawal.delegatedAddress
-            )
-        )
-        );
-    }
 
     function migrateRelatedL1StakerShares(address staker, address strategy, uint256 shares, uint256 l1UnStakeMessageNonce) external onlyRelayer returns (bool) {
         stakerStrategyL1BackShares[staker][strategy] += shares;

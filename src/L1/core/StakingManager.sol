@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
-import { Math } from "@openzeppelin/contracts/utils/math/Math.sol";
+import  "@openzeppelin/contracts/utils/math/Math.sol";
 import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import  "../interfaces/IStakingManager.sol";
 import { IDETH } from "../interfaces/IDETH.sol";
@@ -11,7 +11,7 @@ import {L1Base} from "./L1Base.sol";
 import { IUnstakeRequestsManagerWrite } from "../interfaces/IUnstakeRequestsManager.sol";
 
 
-contract StakingManager is L1Base{
+contract StakingManager is L1Base, IStakingManager {
     /// @notice 允许触发管理任务的角色，例如向解除质押请求管理器分配资金 / 提取盈余，以及设置合约的各种参数。
     bytes32 public constant STAKING_MANAGER_ROLE = keccak256("STAKING_MANAGER_ROLE");
 
@@ -44,7 +44,7 @@ contract StakingManager is L1Base{
     /// @dev 跟踪此项是为了确保我们不会为同一个验证者公钥deposits两次，这是本合约和相关链下会计的基本假设。
     mapping(bytes pubkey => bool exists) public usedValidators;
 
-    /// @inheritdoc IStakingInitiationRead
+    /// @inheritdoc IStakingManagerInitiationRead
     /// @dev 这是为了记录仍在传输中的 ETH，即已发送到deposits合约但尚未被信标链处理的 ETH。
     /// 一旦链下预言机检测到这些deposits，它们将在预言机合约中记录为 `totalDepositsProcessed` 以避免重复计数。
     uint256 public totalDepositedInValidators;
@@ -88,7 +88,7 @@ contract StakingManager is L1Base{
     /// @notice 质押白名单标志，启用时仅允许白名单中的地址进行质押。
     bool public isStakingAllowlist;
 
-    /// @inheritdoc IStakingInitiationRead
+    /// @inheritdoc IStakingManagerInitiationRead
     /// @dev 这将用于为链下服务提供一个合理的起始时间点来开始他们的分析。
     uint256 public initializationBlockNumber;
 
@@ -163,8 +163,8 @@ contract StakingManager is L1Base{
     /// @notice 通过将相应的 dETH 转移到质押合约并在解除质押请求管理器上创建请求来处理用户的解除质押请求。
     /// @param dethAmount 要解除质押的 dETH 数量。
     /// @param minETHAmount 用户期望获得的最小 ETH 数量。
-    /// @param l2Strategy
-    /// @param destChainId
+    /// @param l2Strategy L2 上的策略合约地址
+    /// @param destChainId 目标链 ID
     function _unstakeRequest(uint128 dethAmount, uint128 minETHAmount, address l2Strategy, uint256 destChainId) internal {
         if (getL1Pauser().isUnstakeRequestsAndClaimsPaused()) {
             revert Paused();
@@ -301,7 +301,7 @@ contract StakingManager is L1Base{
         }
     }
 
-    /// @inheritdoc IStakingReturnsWrite
+    /// @inheritdoc IStakingManagerReturnsWrite
     /// @dev 旨在在由 reclaimAllocatedETHSurplus() 启动的同一交易中调用。
     /// 这应该只在紧急情况下调用，例如，如果解除质押请求管理器已取消未完成的请求并且存在盈余余额。
     /// 将接收到的资金添加到未分配余额。
@@ -369,7 +369,7 @@ contract StakingManager is L1Base{
         }
     }
 
-    /// @inheritdoc IStakingReturnsWrite
+    /// @inheritdoc IStakingManagerReturnsWrite
     /// @dev 将接收到的资金添加到未分配余额。
     function receiveReturns() external payable onlyReturnsAggregator {
         emit ReturnsReceived(msg.value);

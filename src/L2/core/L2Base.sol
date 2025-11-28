@@ -6,7 +6,7 @@ import "@openzeppelin-upgrades/contracts/proxy/utils/Initializable.sol";
 import "@openzeppelin-upgrades/contracts/access/OwnableUpgradeable.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-import {IL2Pauser} from "../access/interface/IL2Pauser.sol";
+import {IL2Pauser} from "../../access/interface/IL2Pauser.sol";
 import {IL2Locator} from "../interfaces/IL2Locator.sol";
 import {IStrategyManager} from "../interfaces/IStrategyManager.sol";
 import {ISlashManager} from "../interfaces/ISlashManager.sol";
@@ -14,7 +14,7 @@ import {IDelegationManager} from "../interfaces/IDelegationManager.sol";
 import {IStrategy} from "../interfaces/IStrategy.sol";
 
 abstract contract L2Base is Initializable, OwnableUpgradeable, ReentrancyGuard {
-    address locator;
+    address public locator;
 
     /**
      * @dev

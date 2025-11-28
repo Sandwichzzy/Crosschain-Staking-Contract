@@ -6,8 +6,11 @@ import {
     AccessControlEnumerableUpgradeable
 } from "@openzeppelin-upgrades/contracts/access/extensions/AccessControlEnumerableUpgradeable.sol";
 import {AccessControlEnumerable} from "@openzeppelin/contracts/access/extensions/AccessControlEnumerable.sol";
+import "./interface/IL2Pauser.sol";
 
-contract L2Pauser is Initializable, AccessControlEnumerableUpgradeable {
+contract L2Pauser is Initializable, AccessControlEnumerableUpgradeable,IL2Pauser {
+
+
     bytes32 public constant PAUSER_ROLE = keccak256("PAUSER_ROLE");
 
     bytes32 public constant UNPAUSER_ROLE = keccak256("UNPAUSER_ROLE");

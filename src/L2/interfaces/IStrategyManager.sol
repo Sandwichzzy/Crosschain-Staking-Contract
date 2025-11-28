@@ -35,6 +35,9 @@ interface IStrategyManager {
     /// @param strategy 被移除的策略合约
     event StrategyRemovedFromDepositWhitelist(address strategy);
 
+
+    event MigrateRelatedL1StakerShares(address staker, address strategy, uint256 shares, uint256 l1UnStakeMessageNonce);
+
     /**
      * @notice 将weth代币存入指定策略
      * @param strategy 目标策略合约
