@@ -1,10 +1,6 @@
 # 跨链质押协议 (Cross-Chain Staking Protocol)
 
-[English](#english-version) | [中文](#中文版本)
-
----
-
-## 中文版本
+## v1.0
 
 ### 📖 项目简介
 
@@ -361,31 +357,3 @@ dETH 汇率 = 协议总控制 ETH / dETH 总供应量
 
 ---
 
-### 📞 联系方式
-
-- **GitHub**: [项目仓库](https://github.com/your-org/crosschain-staking)
-- **文档**: [完整文档](https://docs.your-protocol.com)
-
----
-
-### 📄 许可证
-
-本项目采用 MIT 许可证。
-
----
-
-## English Version
-
-> 🚧 English documentation is under construction. Please refer to the Chinese version above.
-
-### Quick Links
-
-- [Architecture](./docs/flows/architecture.md)
-- [Staking Flow](./docs/flows/1-staking-flow.md)
-- [Rewards Distribution](./docs/flows/2-rewards-flow.md)
-- [Unstaking Process](./docs/flows/3-unstaking-flow.md)
-- [Withdrawal Completion](./docs/flows/4-withdrawal-flow.md)
-
----
-
-**Built with ❤️ by the Cross-Chain Staking Team**
