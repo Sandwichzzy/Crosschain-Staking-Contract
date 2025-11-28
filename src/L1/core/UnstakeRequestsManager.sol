@@ -84,8 +84,8 @@ contract UnstakeRequestsManager is
     /// @param ethRequested 请求的 ETH 数量
     /// @param destChainId 目标链 ID
     function create(address requester, address l2Strategy, uint256 dETHLocked, uint256 ethRequested, uint256 destChainId)
-    external
-    onlyStakingContract
+        external
+        onlyStakingContract
     {
         uint256 currentCumulativeETHRequested = latestCumulativeETHRequested + ethRequested;
 

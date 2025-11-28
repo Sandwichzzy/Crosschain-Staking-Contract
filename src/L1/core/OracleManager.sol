@@ -104,8 +104,12 @@ contract OracleManager is L1Base, IOracleManager {
         _pushRecord(OracleRecord(0, uint64(getStakingManager().initializationBlockNumber()), 0, 0, 0, 0, 0, 0), msg.sender, msg.sender, 0, 0);
     }
 
+
+    // ============================================
+    // 核心函数 - 接收和处理记录
+    // ============================================
     /// @notice 接收并处理新的预言机记录
-    /// @dev 仅预言机更新者可调用,执行验证和合理性检查
+    /// @dev 仅预言机更新者可调用,执行验证和合理性检查.如果更新无效则回滚。如果更新有效但未通过 `_sanityCheckUpdate`，则更新被标记为待处理，
     /// @param newRecord 新的预言机记录
     /// @param bridge 桥接合约地址
     /// @param l2Strategy L2 策略地址
@@ -125,7 +129,7 @@ contract OracleManager is L1Base, IOracleManager {
         }
 
         validateUpdate(_records.length - 1, newRecord);
-
+        //Finalize区块检查，每次提交收益记录，检测对应取款是否是Finalized,防止收益被回滚
         uint256 updateFinalizingBlock = newRecord.updateEndBlock + finalizationBlockNumberDelta;
         if (block.number < updateFinalizingBlock) {
             revert UpdateEndBlockNumberNotFinal(updateFinalizingBlock);
@@ -203,7 +207,7 @@ contract OracleManager is L1Base, IOracleManager {
     }
 
     /// @notice 验证新记录的完整性
-    /// @dev 检查记录的区块范围、存款和验证者数量的一致性
+    /// @dev 检查记录的区块范围、存款和验证者数量的一致性.如果预言机记录未通过验证则回滚。这比合理性检查更严格，因为验证逻辑确保我们的预言机不变量保持完整
     /// @param prevRecordIndex 前一条记录的索引
     /// @param newRecord 新记录
     function validateUpdate(uint256 prevRecordIndex, OracleRecord calldata newRecord) public view {
@@ -212,10 +216,12 @@ contract OracleManager is L1Base, IOracleManager {
             revert InvalidUpdateEndBeforeStartBlock(newRecord.updateEndBlock, newRecord.updateStartBlock);
         }
 
+        // 确保预言机记录对齐，即确保新记录窗口从前一条记录结束的地方继续
         if (newRecord.updateStartBlock != prevRecord.updateEndBlock + 1) {
             revert InvalidUpdateStartBlock(prevRecord.updateEndBlock + 1, newRecord.updateStartBlock);
         }
 
+        // 确保链下预言机只跟踪来自协议的存款。共识层上已处理的存款最多为协议已存入存款合约的以太币数量
         if (newRecord.cumulativeProcessedDepositAmount > getStakingManager().totalDepositedInValidators()) {
             revert InvalidUpdateMoreDepositsProcessedThanSent(
                 newRecord.cumulativeProcessedDepositAmount, getStakingManager().totalDepositedInValidators()

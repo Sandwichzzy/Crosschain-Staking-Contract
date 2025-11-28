@@ -13,32 +13,32 @@ contract L1RewardManager is IL1RewardManager, L2Base{
     /// @notice L1 收益余额,记录从 L1 桥接过来的 ETH 总量
     uint256 public L1RewardBalance;
 
-    /// @notice 分配对象结构体(暂未使用)
-    struct AllocateObj {
-        StrategyObj[] strategies;
-    }
+//    /// @notice 分配对象结构体(暂未使用)
+//    struct AllocateObj {
+//        StrategyObj[] strategies;
+//    }
+//
+//    /// @notice 策略对象结构体(暂未使用)
+//    struct StrategyObj {
+//        address strategy;
+//        OperatorObj[] operators;
+//    }
+//
+//    /// @notice 运营商对象结构体(暂未使用)
+//    struct OperatorObj {
+//        address strategy;
+//        StakerObj[] stakers;
+//    }
+//
+//    /// @notice 质押者对象结构体(暂未使用)
+//    struct StakerObj {
+//        address staker;
+//        uint256 share;
+//    }
 
-    /// @notice 策略对象结构体(暂未使用)
-    struct StrategyObj {
-        address strategy;
-        OperatorObj[] operators;
-    }
-
-    /// @notice 运营商对象结构体(暂未使用)
-    struct OperatorObj {
-        address strategy;
-        StakerObj[] stakers;
-    }
-
-    /// @notice 质押者对象结构体(暂未使用)
-    struct StakerObj {
-        address staker;
-        uint256 share;
-    }
-
-    /// @notice 记录每个质押者在特定策略和运营商下的奖励
-    /// @dev mapping(质押者 => mapping(策略 => mapping(运营商 => 奖励金额)))
-    mapping(address => mapping(address => mapping (address => uint256) )) public stakerStrategyOperatorReward;
+//    /// @notice 记录每个质押者在特定策略和运营商下的奖励
+//    /// @dev mapping(质押者 => mapping(策略 => mapping(运营商 => 奖励金额)))
+//    mapping(address => mapping(address => mapping (address => uint256) )) public stakerStrategyOperatorReward;
 
     constructor(){
         _disableInitializers();

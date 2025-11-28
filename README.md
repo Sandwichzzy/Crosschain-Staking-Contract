@@ -1,66 +1,391 @@
-## Foundry
+# 跨链质押协议 (Cross-Chain Staking Protocol)
 
-**Foundry is a blazing fast, portable and modular toolkit for Ethereum application development written in Rust.**
+[English](#english-version) | [中文](#中文版本)
 
-Foundry consists of:
+---
 
-- **Forge**: Ethereum testing framework (like Truffle, Hardhat and DappTools).
-- **Cast**: Swiss army knife for interacting with EVM smart contracts, sending transactions and getting chain data.
-- **Anvil**: Local Ethereum node, akin to Ganache, Hardhat Network.
-- **Chisel**: Fast, utilitarian, and verbose solidity REPL.
+## 中文版本
 
-## Documentation
+### 📖 项目简介
 
-https://book.getfoundry.sh/
+这是一个基于以太坊信标链质押的**跨链质押协议**,允许用户在 Layer 2 上质押资产,通过跨链桥将资金汇聚到以太坊主网(L1)进行验证者质押,并将质押收益分发回 L2。
 
-## Usage
+#### 核心特点
 
-### Build
+- ✅ **跨链质押**: L2 用户可以参与 L1 以太坊验证者质押
+- ✅ **流动性凭证**: 质押 ETH 后获得 dETH 代币,保持资产流动性
+- ✅ **双层收益**:
+  - L1 收益:以太坊验证者奖励(ETH)
+  - L2 收益:平台原生代币(DappLink Token)
+- ✅ **委托质押**: 支持将资产委托给专业运营商
+- ✅ **灵活解质押**: 支持排队取款机制,完成后可取回资产
+- ✅ **安全可靠**: 预言机双层验证、暂停机制、重入保护等多重安全保障
 
-```shell
-$ forge build
+#### 技术栈
+
+- **智能合约**: Solidity 0.8.20 / 0.8.24
+- **开发框架**: Foundry
+- **升级模式**: OpenZeppelin Upgradeable Contracts
+- **跨链通信**: 自定义消息桥接协议
+
+---
+
+### 🏗️ 系统架构
+
+详细架构图请查看 [docs/flows/architecture.md](./docs/flows/architecture.md)
+
+#### L1 层合约架构
+
+| 合约名称 | 功能描述 | 关键函数 |
+|---------|---------|---------|
+| **StakingManager** | 质押管理,ETH 汇聚和 dETH 铸造 | `stake()`, `unstakeRequest()`, `allocateETH()` |
+| **DETH** | 质押凭证代币(ERC20) | `mint()`, `burn()`, `transfer()` (带桥接) |
+| **UnstakeRequestsManager** | 解质押请求管理和申领 | `create()`, `claim()`, `allocateETH()` |
+| **OracleManager** | 预言机记录验证者状态 | `receiveRecord()`, `validateUpdate()`, `sanityCheckUpdate()` |
+| **ReturnsAggregator** | 收益聚合和费用收取 | `processReturns()` |
+| **ReturnsReceiver** | 接收验证者提款 | `transfer()` |
+| **L1PoolManager** | L1 资金池管理 | `DepositAndStakingETH()`, `BridgeFinalizeETHForStaking()` |
+| **L1Pauser** | L1 暂停控制 | `pauseAll()`, `unpauseAll()` |
+| **L1Locator** | 服务定位器 | `coreComponents()` |
+
+#### L2 层合约架构
+
+| 合约名称 | 功能描述 | 关键函数 |
+|---------|---------|---------|
+| **StrategyManager** | 策略管理和份额分配 | `depositETHIntoStrategy()`, `removeShares()`, `withdrawSharesAsWeth()` |
+| **DelegationManager** | 委托管理和运营商份额 | `delegateTo()`, `undelegate()`, `queueWithdrawals()`, `completeQueuedWithdrawal()` |
+| **Strategy** | 具体质押策略实现 | `deposit()`, `withdraw()`, `shares()`, `totalShares()` |
+| **L1RewardManager** | L1 收益管理(部署在 L2) | `depositETHRewardTo()`, `claimL1Reward()` |
+| **L2RewardManager** | L2 代币收益管理 | `calculateFee()`, `stakerClaimReward()`, `operatorClaimReward()` |
+| **L2PoolManager** | L2 资金池管理 | `WithdrawETHtoL1()`, `WithdrawWETHToL1()` |
+| **L2Pauser** | L2 暂停控制 | `pauseAll()`, `unpauseAll()` |
+| **L2Locator** | 服务定位器 | `coreComponents()` |
+
+#### 桥接层架构
+
+| 合约名称 | 功能描述 | 关键函数 |
+|---------|---------|---------|
+| **TokenBridgeBase** | 跨链桥基础合约 | `BridgeInitiateETH()`, `BridgeFinalizeETH()`, `BridgeInitiateStakingMessage()` |
+| **MessageManager** | 跨链消息管理 | `sendMessage()`, `claimMessage()` |
+
+---
+
+### 🔑 核心概念
+
+#### 1. dETH (Derivative ETH)
+- **定义**: 用户质押 ETH 后获得的凭证代币
+- **特点**: ERC20 标准,可转账,可跨链
+- **汇率**: 动态汇率,根据协议总控制 ETH 和 dETH 总供应量计算
+  ```
+  dETH 汇率 = 协议总控制 ETH / dETH 总供应量
+  ```
+- **用途**:
+  - 作为质押凭证
+  - 可以转账给他人(自动触发 L2 份额转移)
+  - 解质押时销毁以换回 ETH
+
+#### 2. Shares (份额)
+- **定义**: L2 上用户在特定策略中的份额
+- **计算**: 由各 Strategy 合约根据存入金额和当前汇率计算
+- **管理**:
+  - `stakerStrategyShares[staker][strategy]`: StrategyManager 中记录
+  - `operatorShares[operator][strategy]`: DelegationManager 中记录运营商份额
+
+#### 3. Strategies (策略)
+- **定义**: L2 上的质押策略合约,管理不同类型的资产
+- **类型**:
+  - ETH Strategy: 管理原生 ETH
+  - WETH Strategy: 管理 Wrapped ETH
+  - ERC20 Strategy: 管理其他 ERC20 代币
+
+#### 4. Operators (运营商)
+- **定义**: 专业的验证者运营商,接受用户委托
+- **职责**:
+  - 运行验证者节点
+  - 维护节点稳定性和安全性
+  - 获得 8% 的 L2 代币奖励
+
+#### 5. Oracle (预言机)
+- **定义**: 链下服务,监控以太坊验证者状态并提交记录
+- **安全机制**:
+  - **完整性验证** (`validateUpdate`): 检查数据一致性
+  - **合理性检查** (`sanityCheckUpdate`): 检查余额变化是否在合理范围
+  - **待处理机制**: 未通过合理性检查需管理员审批
+  - **自动暂停**: 检测异常时全局暂停
+
+---
+
+### 🔄 四大核心业务流程
+
+详细流程图请查看 [docs/flows/](./docs/flows/) 目录。
+
+#### 流程 1: 用户质押 (L1 → L2)
+
+**概述**: 用户在 L1 存入 ETH,通过桥接获得 L2 份额,并可选择委托给运营商。
+
+**主要步骤**:
+1. 用户在 L1PoolManager 存入 ETH
+2. Relayer 触发质押,调用 StakingManager.stake()
+3. StakingManager 铸造 dETH 给用户
+4. 用户转移 dETH 触发跨链消息
+5. Relayer 中继消息到 L2
+6. L2 StrategyManager 更新用户份额
+7. 用户在 L2 存入策略并可选委托
+
+**详细流程图**: [1-staking-flow.md](./docs/flows/1-staking-flow.md)
+
+---
+
+#### 流程 2: 质押奖励分发
+
+**概述**: 验证者产生奖励,通过预言机记录,经 ReturnsAggregator 收取费用后,分别分发 L1 和 L2 收益。
+
+**L1 收益分发**:
+1. 验证者奖励自动提款到 ReturnsReceiver
+2. Oracle Updater 提交验证者状态记录
+3. OracleManager 验证并触发 ReturnsAggregator.processReturns()
+4. ReturnsAggregator 收取协议费用(默认 10%)
+5. EL 收益桥接到 L2 的 L1RewardManager
+6. CL 净收益转入 StakingManager 的 unallocatedETH
+7. 用户在 L2 通过 L1RewardManager.claimL1Reward() 申领
+
+**L2 收益分发**:
+1. 管理员向 L2RewardManager 充值 DappLink Token
+2. 链下服务计算收益并调用 calculateFee()
+3. 质押者获得 92%,运营商获得 8%
+4. 用户通过 stakerClaimReward() 申领
+
+**详细流程图**: [2-rewards-flow.md](./docs/flows/2-rewards-flow.md)
+
+---
+
+#### 流程 3: 排队取款 (L2 → L1)
+
+**概述**: 用户发起解质押,创建提款请求,等待完成条件满足。
+
+**主要步骤**:
+1. **L2 解委托**: 用户调用 `DelegationManager.undelegate()` 或 `queueWithdrawals()`
+2. **跨链通知 L1**: 调用 `StakingManager.unstakeRequest()`
+3. **等待完成条件**: 区块等待期 + 资金充足
+4. **查询可申领**: `UnstakeRequestsManager.requestInfo()`
+
+**详细流程图**: [3-unstaking-flow.md](./docs/flows/3-unstaking-flow.md)
+
+---
+
+#### 流程 4: 取款完成
+
+**概述**: 条件满足后,Relayer 触发申领,销毁 dETH,桥接 ETH 到 L2,用户完成提款。
+
+**主要步骤**:
+1. **Relayer 触发 L1 申领**: `StakingManager.claimUnstakeRequest()`
+2. **ETH 桥接到 L2**: `BridgeInitiateETH()` → Relayer 中继 → `BridgeFinalizeETH()`
+3. **同步 L1 返还份额**: `StrategyManager.migrateRelatedL1StakerShares()`
+4. **L2 完成提款**: `DelegationManager.completeQueuedWithdrawal()`
+
+**详细流程图**: [4-withdrawal-flow.md](./docs/flows/4-withdrawal-flow.md)
+
+---
+
+### 👥 角色和权限
+
+| 角色 | 描述 | 主要职责 |
+|------|------|----------|
+| **用户 (User)** | 普通质押用户 | 质押、解质押、申领奖励、委托 |
+| **Relayer** | 跨链消息中继者 | 监听事件、中继消息、触发跨链操作 |
+| **Oracle Updater** | 预言机更新者 | 提交验证者状态记录 |
+| **Admin** | 系统管理员 | 设置合约参数、授予角色、应急管理 |
+| **Operator** | 验证者运营商 | 运行验证者节点、接受委托 |
+
+#### 权限矩阵
+
+| 功能 | 用户 | Relayer | Oracle | Admin |
+|------|:----:|:-------:|:------:|:-----:|
+| 质押 ETH | ✅ | ❌ | ❌ | ❌ |
+| 桥接质押 | ❌ | ✅ | ❌ | ❌ |
+| 提交预言机记录 | ❌ | ❌ | ✅ | ❌ |
+| 分配 ETH | ❌ | ❌ | ❌ | ✅ |
+| 启动验证者 | ❌ | ❌ | ❌ | ✅ |
+| 发起解质押 | ✅ | ❌ | ❌ | ❌ |
+| 申领解质押 | ❌ | ✅ | ❌ | ❌ |
+| 完成提款 | ✅ | ❌ | ❌ | ❌ |
+| 暂停合约 | ❌ | ❌ | ❌ | ✅ |
+
+---
+
+### ⚙️ 关键参数配置
+
+#### 金额限制参数
+
+| 参数名称 | 默认值 | 说明 |
+|---------|--------|------|
+| `minimumDepositAmount` | 32 ETH | StakingManager 最小质押金额 |
+| `minimumUnstakeBound` | 0.01 ETH | 最小解质押金额 |
+| `maximumDETHSupply` | 1024 ETH | dETH 最大供应量 |
+
+#### 时间限制参数
+
+| 参数名称 | 默认值 | 说明 |
+|---------|--------|------|
+| `numberOfBlocksToFinalize` | 可配置 | 解质押请求完成所需区块数 |
+| `finalizationBlockNumberDelta` | 64 blocks | 预言机记录 Finalize 等待期 |
+
+#### 费率参数
+
+| 参数名称 | 默认值 | 说明 |
+|---------|--------|------|
+| `feesBasisPoints` | 1000 (10%) | 协议费用比例 |
+| `stakerPercent` | 92% | 质押者收益占比 |
+| `operatorPercent` | 8% | 运营商收益占比 |
+
+---
+
+### 🛡️ 安全机制
+
+#### 1. 暂停机制
+- L1: 可暂停质押、解质押、验证者启动、预言机提交
+- L2: 可暂停策略存款、委托、解委托、提款
+- 触发: 管理员手动或预言机检测异常自动触发
+
+#### 2. 预言机双层验证
+- **完整性验证**: 检查数据一致性,失败则回滚
+- **合理性检查**: 检查余额变化是否合理,失败则待处理
+- **待处理机制**: 异常记录需管理员审批
+- **自动暂停**: 检测异常自动触发全局暂停
+
+#### 3. Finalize 检查
+防止提款回滚,确保提交的预言机记录对应的区块已经 Finalize
+
+#### 4. 重入保护
+使用 OpenZeppelin `ReentrancyGuard`,关键函数标记 `nonReentrant`
+
+#### 5. 访问控制
+基于角色的权限管理(RBAC),使用 OpenZeppelin `AccessControlEnumerable`
+
+---
+
+### 💻 开发指南
+
+#### 环境要求
+
+- **Solidity**: ^0.8.20 / ^0.8.24
+- **Foundry**: 最新版本
+  ```bash
+  curl -L https://foundry.paradigm.xyz | bash
+  foundryup
+  ```
+
+#### 安装依赖
+
+```bash
+# 克隆仓库
+git clone <repository-url>
+cd Crosschain-contract
+
+# 安装 Foundry 依赖
+forge install
 ```
 
-### Test
+#### 编译合约
 
-```shell
-$ forge test
+```bash
+# 编译所有合约
+forge build
+
+# 显示详细信息
+forge build --force
 ```
 
-### Format
+#### 运行测试
 
-```shell
-$ forge fmt
+```bash
+# 运行所有测试
+forge test
+
+# 显示详细输出
+forge test -vvvv
+
+# 生成测试覆盖率报告
+forge coverage
 ```
 
-### Gas Snapshots
+#### 格式化代码
 
-```shell
-$ forge snapshot
+```bash
+# 格式化所有 Solidity 文件
+forge fmt
+
+# 检查格式(不修改)
+forge fmt --check
 ```
 
-### Anvil
+---
 
-```shell
-$ anvil
+### ❓ FAQ (常见问题)
+
+#### Q1: dETH 的汇率如何计算?
+
+**A**: dETH 的汇率动态调整,公式为:
 ```
-
-### Deploy
-
-```shell
-$ forge script script/Counter.s.sol:CounterScript --rpc-url <your_rpc_url> --private-key <your_private_key>
+dETH 汇率 = 协议总控制 ETH / dETH 总供应量
 ```
+当验证者产生奖励时,协议总控制 ETH 增加,dETH 汇率上升。
 
-### Cast
+#### Q2: 为什么叫 L1RewardManager 却部署在 L2?
 
-```shell
-$ cast <subcommand>
-```
+**A**: `L1RewardManager` 虽然部署在 L2,但它管理的是从 L1 桥接过来的 ETH 质押收益,因此命名为 L1RewardManager。
 
-### Help
+#### Q3: 解质押需要多长时间?
 
-```shell
-$ forge --help
-$ anvil --help
-$ cast --help
-```
+**A**: 解质押时间取决于:
+1. 区块等待期: `numberOfBlocksToFinalize` 个区块
+2. 资金可用性: UnstakeRequestsManager 中是否有足够的 ETH
+
+#### Q4: 为什么需要 Relayer?
+
+**A**: Relayer 负责:
+1. 监听 L1 和 L2 的跨链事件
+2. 中继消息到目标链
+3. 触发需要权限的操作
+4. 同步 L1 和 L2 的状态
+
+#### Q5: 如何成为运营商?
+
+**A**: 调用 `DelegationManager.registerAsOperator(operatorDetails, metadataURI)` 注册为运营商。
+
+#### Q6: 协议费用如何收取?
+
+**A**: 协议从 L1 验证者奖励中收取:
+- 默认费率: 10%
+- 仅从奖励中收取,本金不收费
+
+---
+
+### 📞 联系方式
+
+- **GitHub**: [项目仓库](https://github.com/your-org/crosschain-staking)
+- **文档**: [完整文档](https://docs.your-protocol.com)
+
+---
+
+### 📄 许可证
+
+本项目采用 MIT 许可证。
+
+---
+
+## English Version
+
+> 🚧 English documentation is under construction. Please refer to the Chinese version above.
+
+### Quick Links
+
+- [Architecture](./docs/flows/architecture.md)
+- [Staking Flow](./docs/flows/1-staking-flow.md)
+- [Rewards Distribution](./docs/flows/2-rewards-flow.md)
+- [Unstaking Process](./docs/flows/3-unstaking-flow.md)
+- [Withdrawal Completion](./docs/flows/4-withdrawal-flow.md)
+
+---
+
+**Built with ❤️ by the Cross-Chain Staking Team**
