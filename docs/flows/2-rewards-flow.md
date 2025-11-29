@@ -1496,4 +1496,4 @@ if (newGrossCLBalance < lowerBound) {
 - [系统架构图](./architecture.md)
 - [质押流程详解](./1-staking-flow.md)
 - [解质押流程详解](./3-unstaking-flow.md)
-- [取款完成详解](./4-withdrawal-flow.md)
+

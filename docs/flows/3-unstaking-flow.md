@@ -1227,6 +1227,123 @@ T2: Relayer 调用 claim() -> dETH 销毁 + ETH 通过桥接发送到 L2
 
 ---
 
+## 批量申领机制
+
+### 工作原理
+
+**批量申领 vs 单个申领对比**:
+
+| 特性 | 单个申领 | 批量申领 (实际实现) |
+|------|----------|-------------------|
+| **函数签名** | `claimUnstakeRequest(uint256 requestId, ...)` | `claimUnstakeRequest(requestsInfo[] memory requests, ...)` |
+| **处理能力** | 一次一个请求 | 一次多个请求 |
+| **Gas 效率** | 低 (每个请求单独交易) | 高 (批量处理) |
+| **Relayer 负担** | 高 (需要多次调用) | 低 (一次调用) |
+| **数据结构** | 使用 `requestId` 索引 | 使用 `(destChainId, l2Strategy)` 键 |
+
+**requestsInfo 结构体**:
+
+```solidity
+/// @notice 解质押请求信息结构体
+struct requestsInfo {
+    address requestAddress;      // L2 策略合约地址
+    uint256 unStakeMessageNonce; // 解质押消息的 nonce
+}
+```
+
+**批量申领示例**:
+
+```javascript
+// Relayer 收集多个可申领请求
+const requests = [
+    {
+        requestAddress: '0xStrategy1',  // Arbitrum WETH Strategy
+        unStakeMessageNonce: 123
+    },
+    {
+        requestAddress: '0xStrategy2',  // Optimism WETH Strategy
+        unStakeMessageNonce: 124
+    },
+    {
+        requestAddress: '0xStrategy3',  // Base WETH Strategy
+        unStakeMessageNonce: 125
+    }
+];
+
+// 一次性申领所有请求
+await stakingManager.claimUnstakeRequest(
+    requests,
+    1,        // sourceChainId: Ethereum
+    42161,    // destChainId: Arbitrum (或其他 L2)
+    2000000   // gasLimit
+);
+```
+
+### Gas 优化
+
+**单个申领**:
+```
+Transaction 1: claim(strategy1) → 200k gas
+Transaction 2: claim(strategy2) → 200k gas
+Transaction 3: claim(strategy3) → 200k gas
+Total: 600k gas + (21k × 3 = 63k base) = 663k gas
+```
+
+**批量申领**:
+```
+Transaction 1: claim([strategy1, strategy2, strategy3])
+  → Base: 21k gas
+  → First claim: 200k gas
+  → Second claim: ~150k gas (warm storage)
+  → Third claim: ~150k gas (warm storage)
+Total: 21k + 200k + 150k + 150k = 521k gas
+
+节省: 663k - 521k = 142k gas (~21%)
+```
+
+### 合约处理流程
+
+```solidity
+/// @notice 批量申领解质押请求
+function claim(
+    requestsInfo[] memory requests,
+    uint256 sourceChainId,
+    uint256 destChainId,
+    uint256 gasLimit
+) external onlyStakingContract {
+    if (requests.length == 0) {
+        revert NoRequests();
+    }
+
+    for (uint256 i = 0; i < requests.length; i++) {
+        address requester = requests[i].requestAddress;  // 实际是 l2Strategy
+        uint256 unStakeMessageNonce = requests[i].unStakeMessageNonce;
+        _claim(requester, unStakeMessageNonce, sourceChainId, destChainId, gasLimit);
+    }
+}
+```
+
+**处理逻辑**:
+1. 遍历 `requests[]` 数组
+2. 对每个请求调用 `_claim()`
+3. `_claim()` 中:
+   - 读取聚合数据
+   - 删除聚合数据
+   - 销毁 dETH
+   - 桥接 ETH 到 L2 Strategy
+
+**优势**:
+1. **节省 gas**: 多个用户的请求合并处理
+2. **简化桥接**: 一次跨链消息处理所有聚合的请求
+3. **批量销毁**: 一次性销毁大量 dETH,减少交易数
+
+**劣势**:
+1. **无法单独取消**: 必须整体申领
+2. **区块号覆盖**: 使用最新请求的区块号
+3. **资金依赖**: 需要等待所有之前的请求资金到位
+
+---
+
 ## 聚合请求机制
 
 ### 核心概念
@@ -1335,15 +1452,87 @@ mapping(address => mapping(address => uint256)) public stakerStrategyL1BackShare
 ### L1BackShares 的生命周期
 
 ```mermaid
-graph LR
-    A[L1 质押 ETH] -->|跨链| B[L2 Strategy 接收 ETH]
-    B -->|Relayer 调用| C[migrateRelatedL1StakerShares]
-    C -->|增加| D[l1BackShares]
-    D -->|用户提款| E[withdrawSharesAsWeth]
-    E -->|检查| F{l1BackShares >= shares?}
-    F -->|是| G[Strategy.withdraw]
-    G -->|减少| H[updateStakerStrategyL1BackShares]
-    F -->|否| I[拒绝提款]
+stateDiagram-v2
+    [*] --> L1Request: 用户创建解质押请求
+    L1Request --> L1Claimed: Relayer 申领
+    L1Claimed --> L2Bridged: ETH 桥接到 L2 Strategy
+    L2Bridged --> L1BackSharesSynced: Relayer 同步 L1BackShares
+    L1BackSharesSynced --> ReadyToWithdraw: l1BackShares += shares
+    ReadyToWithdraw --> WithdrawalCheck: 用户完成提款队列
+    WithdrawalCheck --> WithdrawalSuccess: l1BackShares >= shares ✅
+    WithdrawalCheck --> WithdrawalFailed: l1BackShares < shares ❌
+    WithdrawalSuccess --> L1BackSharesDecreased: l1BackShares -= shares
+    L1BackSharesDecreased --> [*]: 提款完成
+    WithdrawalFailed --> ReadyToWithdraw: 等待同步
+```
+
+**完整生命周期说明**:
+
+```
+1. 创建解质押请求 (流程阶段 3)
+   → 用户在 L1 调用 unstakeRequest()
+   → dETH 转移到 UnstakeRequestsManager
+   → l1BackShares 状态: 0 (尚未同步)
+
+2. Relayer 申领 (流程阶段 5)
+   → ETH 桥接到 L2 Strategy
+   → l1BackShares 状态: 0 (等待 Relayer 同步)
+
+3. Relayer 同步 L1BackShares
+   → Relayer 调用 migrateRelatedL1StakerShares()
+   → ⭐ l1BackShares 增加
+   → l1BackShares 状态: shares (已同步,可提款)
+
+4. 用户完成提款队列 (流程阶段 7)
+   → withdrawSharesAsWeth() 检查 l1BackShares >= shares
+   → Strategy.withdraw() 转账给用户
+   → updateStakerStrategyL1BackShares() 减少 l1BackShares
+   → ⭐ l1BackShares 减少
+   → l1BackShares 状态: 0 (已提款)
+```
+
+### 为什么需要 L1BackShares?
+
+**问题**: 用户在 L2 的策略份额可能来自两个来源:
+1. **L2 原生存款**: 用户直接在 L2 存入 ETH/WETH
+2. **L1 迁移**: 用户在 L1 质押,份额跨链迁移到 L2
+
+**风险**: 如果允许提取尚未从 L1 迁移的份额,会导致双花攻击:
+```
+用户有 100 dETH 在 L1
+→ L1 创建解质押请求
+→ L2 策略显示 100 shares (但 L1 的 ETH 尚未到账)
+→ 用户在 L2 提款 100 shares
+→ 同时在 L1 申领 100 ETH
+→ 双花! 用户获得 200 ETH
+```
+
+**解决方案**: 只有 `l1BackShares` 才能提款。
+
+### 双花攻击防御机制
+
+**攻击者尝试**:
+```
+1. L1 创建解质押请求 (100 dETH → 100 ETH)
+2. 立即在 L2 提款 100 shares
+3. L1 申领完成后再次提款
+```
+
+**防御机制**:
+```
+1. L1 创建请求后,dETH 转移到 UnstakeRequestsManager
+   → 攻击者失去 dETH 控制权
+
+2. L2 提款时检查 l1BackShares
+   - 此时 l1BackShares = 0 (尚未同步)
+   - require(0 >= 100) 失败
+   - 交易回滚 ✅
+
+3. Relayer 申领后同步 l1BackShares = 100
+   → 现在用户可以在 L2 提款
+
+4. 提款后 l1BackShares = 0
+   → 无法再次提款 ✅
 ```
 
 ### 关键函数
@@ -1474,6 +1663,191 @@ function _afterWithdrawal(address recipient, IERC20 weth, uint256 amountToSend) 
 ```
 
 **效果**: 提款后,`l1BackShares` 减少,防止重复提款。
+
+---
+
+## 跨链资金流动
+
+### 完整资金流图
+
+```mermaid
+graph TB
+    subgraph "L1 层"
+        A[用户创建解质押请求] -->|转移 dETH| B[UnstakeRequestsManager]
+        B -->|聚合请求| C[l2ChainStrategyAmount + dEthLockedAmount]
+
+        D[Relayer 触发申领] -->|claimUnstakeRequest| E[StakingManager]
+        E -->|claim| B
+
+        B -->|读取并删除| C
+        B -->|销毁| F[dETH totalSupply 减少]
+        B -->|桥接 ETH| G[L1 TokenBridge]
+
+        G -->|扣除手续费| H[FeePoolValue]
+        G -->|发送消息| I[MessageManager]
+    end
+
+    subgraph "桥接层"
+        I -->|MessageHash| J[Relayer 监听]
+        J -->|中继| K[L2 MessageManager]
+    end
+
+    subgraph "L2 层 - Strategy 接收"
+        K -->|验证| L[L2 TokenBridge]
+        L -->|转账 ETH| M[Strategy 合约]
+        M -->|receive| N[virtualEthBalance 增加]
+    end
+
+    subgraph "L2 层 - L1BackShares 同步"
+        J -->|migrateRelatedL1StakerShares| O[StrategyManager]
+        O -->|记录| P[stakerStrategyL1BackShares 增加]
+    end
+
+    subgraph "L2 层 - 用户提款"
+        Q[用户完成提款队列] -->|completeQueuedWithdrawal| R[DelegationManager]
+        R -->|withdrawSharesAsWeth| O
+        O -->|检查 L1BackShares| S{L1BackShares >= shares?}
+        S -->|是| T[Strategy.withdraw]
+        S -->|否| U[交易回滚]
+
+        T -->|计算金额| V[amountToSend]
+        T -->|转账| W[用户收到 WETH/ETH]
+        T -->|减少| X[stakerStrategyL1BackShares 减少]
+        T -->|减少| Y[virtualEthBalance 减少]
+    end
+
+    style A fill:#e1f5ff
+    style B fill:#ffcccc
+    style F fill:#ffcccc
+    style G fill:#fff4e1
+    style L fill:#fff4e1
+    style M fill:#ccffcc
+    style O fill:#ccccff
+    style W fill:#e1ffe1
+```
+
+### 资金数量变化追踪
+
+**示例: 用户解质押 10 ETH**
+
+#### T0: 创建解质押请求
+```
+L1 StakingManager:
+  - 用户 dETH 余额: 10 dETH → 0 dETH
+  - UnstakeRequestsManager dETH 余额: 0 → 10 dETH
+
+L1 UnstakeRequestsManager:
+  - l2ChainStrategyAmount[chainId][strategy]: 0 → 10 ETH
+  - dEthLockedAmount[chainId][strategy]: 0 → 10 dETH
+```
+
+#### T1: Relayer 申领
+```
+L1 UnstakeRequestsManager:
+  - dETH 余额: 10 dETH → 0 dETH (销毁)
+  - l2ChainStrategyAmount[chainId][strategy]: 10 ETH → 0 (删除)
+  - dEthLockedAmount[chainId][strategy]: 10 dETH → 0 (删除)
+
+L1 dETH:
+  - totalSupply: 1000 dETH → 990 dETH
+
+L1 TokenBridge:
+  - 接收 ETH: 10 ETH
+  - 计算手续费: 0.1 ETH (1%)
+  - 发送金额: 9.9 ETH
+  - FeePoolValue[ETH]: +0.1 ETH
+```
+
+#### T2: 跨链到 L2
+```
+L2 TokenBridge:
+  - 接收 ETH: 9.9 ETH (从 FundingPool)
+  - FundingPoolBalance[ETH]: -9.9 ETH
+
+L2 Strategy:
+  - virtualEthBalance: 100 ETH → 109.9 ETH
+```
+
+#### T3: 同步 L1BackShares
+```
+L2 StrategyManager:
+  - stakerStrategyL1BackShares[user][strategy]: 0 → 9.9 shares
+```
+
+#### T4: 用户完成提款
+```
+假设用户有 10 shares,对应 9.9 ETH
+
+L2 Strategy:
+  - totalShares: 100 shares → 90 shares
+  - virtualEthBalance: 109.9 ETH → 100 ETH
+
+L2 StrategyManager:
+  - stakerStrategyL1BackShares[user][strategy]: 9.9 shares → 0 shares
+
+用户:
+  - ETH 余额: 0 → 9.9 ETH
+```
+
+#### 最终损失
+```
+用户投入: 10 ETH (dETH 价值)
+用户收到: 9.9 ETH
+手续费损失: 0.1 ETH (1%)
+```
+
+### 手续费机制详解
+
+**TokenBridge 手续费计算** (`src/bridge/core/bridge/TokenBridgeBase.sol:148-172`):
+
+```solidity
+function BridgeInitiateETH(
+    uint256 sourceChainId,
+    uint256 destChainId,
+    address to
+) external payable returns (bool) {
+    // ... 验证逻辑 ...
+
+    // 增加资金池余额
+    FundingPoolBalance[ContractsAddress.ETHAddress] += msg.value;
+
+    // ⭐ 计算手续费
+    uint256 fee = (msg.value * PerFee) / 1_000_000;  // 默认 PerFee = 10000 (1%)
+    uint256 amount = msg.value - fee;
+    FeePoolValue[ContractsAddress.ETHAddress] += fee;
+
+    // 发送跨链消息
+    messageManager.sendMessage(block.chainid, destChainId, to, amount, fee);
+
+    emit InitiateETH(sourceChainId, destChainId, msg.sender, to, amount);
+    return true;
+}
+```
+
+**手续费配置**:
+```
+默认配置:
+PerFee = 10000
+计算公式: fee = (msg.value × 10000) / 1_000_000 = msg.value × 0.01 = 1%
+
+示例:
+用户解质押 10 ETH
+- msg.value = 10 ETH
+- fee = 10 × 0.01 = 0.1 ETH
+- amount = 10 - 0.1 = 9.9 ETH (实际到账)
+```
+
+**资金池状态变化**:
+```
+L1 Bridge:
+- FundingPoolBalance[ETH] += 10 ETH
+- FeePoolValue[ETH] += 0.1 ETH
+- 发送消息: amount = 9.9 ETH
+
+L2 Bridge (完成时):
+- FundingPoolBalance[ETH] -= 9.9 ETH
+- 转账给 Strategy: 9.9 ETH
+```
 
 ---
 
@@ -1799,11 +2173,6 @@ T6: 用户在 L2 完成提款队列
 - [系统架构图](./architecture.md)
 - [质押流程详解](./1-staking-flow.md)
 - [奖励分发详解](./2-rewards-flow.md)
-- [取款完成详解](./4-withdrawal-flow.md)
 - [修正说明](./3-unstaking-flow-corrections.md)
 
 ---
-
-_文档版本: 2.0_
-_更新日期: 2025-11-28_
-_基于合约代码版本: src/L2/core/DelegationManager.sol, src/L2/core/StrategyManager.sol, src/L1/core/StakingManager.sol, src/L1/core/UnstakeRequestsManager.sol, src/L2/strategies/StrategyBase.sol_

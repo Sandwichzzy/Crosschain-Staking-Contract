@@ -1,4 +1,4 @@
-# 流程 1: 用户质押 (L1 → L2)
+# 流程 1: 用户质押 (L2 → L1)
 
 ## 📋 目录
 
@@ -13,25 +13,25 @@
 
 ## 流程概述
 
-**目标**: 用户在 L1 存入 ETH,通过跨链桥获得 L2 份额,并可选择委托给运营商参与质押。
+**目标**: 用户在 L2 存入 ETH/WETH 到策略,通过跨链桥将资金转移到 L1,在 L1 铸造 dETH 凭证代币。
 
 **参与角色**:
-- **用户** (User): 在 L1 存入 ETH 的质押者
+- **用户** (User): 在 L2 存入 ETH/WETH 的质押者
 - **Relayer**: 中继跨链消息的链下服务
 - **运营商** (Operator): 可选的委托目标
 
 **关键合约**:
-- **L1 层**: L1PoolManager, StakingManager, DETH
-- **桥接层**: L1 TokenBridge, L2 TokenBridge
-- **L2 层**: StrategyManager, DelegationManager, Strategy
+- **L2 层**: StrategyManager, Strategy (StrategyBase), DelegationManager
+- **桥接层**: L2 TokenBridge, L1 TokenBridge
+- **L1 层**: StakingManager, DETH
 
 **核心流程**:
-1. 用户在 L1 存入 ETH
-2. Relayer 触发质押,铸造 dETH
-3. 用户转移 dETH 触发跨链消息
-4. Relayer 中继消息到 L2
-5. L2 更新用户份额
-6. 用户可选择在 L2 委托给运营商
+1. 用户在 L2 存入 ETH 到策略
+2. L2 策略计算并分配份额
+3. 用户可选择在 L2 委托给运营商
+4. 策略合约积累到 32 ETH 后触发跨链转移
+5. Relayer 中继消息到 L1
+6. L1 StakingManager 批量铸造 dETH
 
 ---
 
@@ -40,181 +40,574 @@
 ```mermaid
 sequenceDiagram
     autonumber
-    actor User as 用户 (L1)
-    participant L1Pool as L1PoolManager
-    participant StakingMgr as StakingManager
-    participant DETH as dETH Token
-    participant L1Bridge as L1 TokenBridge
+    actor User as 用户 (L2)
+    participant StrategyMgr as L2 StrategyManager
+    participant Strategy as L2 Strategy
+    participant DelegationMgr as L2 DelegationManager
     participant Relayer as Relayer (链下)
     participant L2Bridge as L2 TokenBridge
-    participant StrategyMgr as StrategyManager
-    participant Strategy as Strategy
-    participant DelegationMgr as DelegationManager
+    participant L1Bridge as L1 TokenBridge
+    participant StakingMgr as L1 StakingManager
+    participant DETH as dETH Token
     actor Operator as 运营商 (L2)
 
-    Note over User,Operator: 阶段 1: L1 存款和质押
+    Note over User,Operator: 阶段 1: L2 存款和份额分配
 
-    User->>L1Pool: DepositAndStakingETH{value: X ETH}
-    activate L1Pool
-    L1Pool->>L1Pool: 接收并暂存 ETH
-    L1Pool-->>User: emit DepositETH(user, X ETH)
-    deactivate L1Pool
-
-    Note over Relayer: Relayer 监听 DepositETH 事件
-
-    Relayer->>L1Pool: BridgeFinalizeETHForStaking(user, X ETH)
-    activate L1Pool
-    L1Pool->>StakingMgr: stake(user, X ETH)
-    activate StakingMgr
-
-    StakingMgr->>StakingMgr: 检查 minimumDepositAmount
-    StakingMgr->>StakingMgr: 检查 maximumDETHSupply
-    StakingMgr->>StakingMgr: 计算 dETH 数量 = X / dETHToETH汇率
-    StakingMgr->>StakingMgr: unallocatedETH += X ETH
-
-    StakingMgr->>DETH: mint(user, dETH数量)
-    activate DETH
-    DETH->>DETH: totalSupply += dETH数量
-    DETH->>DETH: balances[user] += dETH数量
-    DETH-->>StakingMgr: emit Transfer(0x0, user, dETH数量)
-    deactivate DETH
-
-    StakingMgr-->>L1Pool: emit Staked(user, X ETH, dETH数量)
-    deactivate StakingMgr
-    deactivate L1Pool
-
-    Note over User,L2Bridge: 阶段 2: 跨链桥接 dETH 份额
-
-    User->>DETH: transfer(L2用户地址, dETH数量)
-    activate DETH
-    DETH->>DETH: balances[user] -= dETH数量
-    DETH->>DETH: balances[L2地址] += dETH数量
-    DETH->>L1Bridge: _sendMessageToL2Bridge(user, dETH数量)
-    activate L1Bridge
-    L1Bridge->>L1Bridge: BridgeInitiateStakingMessage
-    L1Bridge-->>DETH: emit BridgeInitiated(user, dETH数量)
-    deactivate L1Bridge
-    DETH-->>User: emit Transfer(user, L2地址, dETH数量)
-    deactivate DETH
-
-    Note over Relayer: Relayer 监听 BridgeInitiated 事件
-
-    Relayer->>L2Bridge: claimMessage(messageHash, proof)
-    activate L2Bridge
-    L2Bridge->>L2Bridge: 验证消息和 proof
-    L2Bridge->>StrategyMgr: BridgeFinalizeStakingMessage(user, dETH数量)
+    User->>StrategyMgr: depositETHIntoStrategy(strategy) {value: X ETH}
     activate StrategyMgr
-
-    StrategyMgr->>StrategyMgr: 将 dETH 转换为策略份额
-    StrategyMgr->>Strategy: deposit(user, amount)
+    StrategyMgr->>StrategyMgr: 检查暂停状态 isStrategyDeposit()
+    StrategyMgr->>Strategy: call{value: X ETH}("")
     activate Strategy
-    Strategy->>Strategy: 计算份额 = amount / 策略汇率
-    Strategy->>Strategy: shares[user] += 份额
-    Strategy->>Strategy: totalShares += 份额
-    Strategy-->>StrategyMgr: return 份额
+    Strategy->>Strategy: 接收 ETH
     deactivate Strategy
 
-    StrategyMgr->>StrategyMgr: stakerStrategyShares[user][strategy] += 份额
+    StrategyMgr->>Strategy: deposit(ETH, X)
+    activate Strategy
+    Strategy->>Strategy: 计算份额使用虚拟余额公式
+    Strategy->>Strategy: newShares = (amount × virtualShareAmount) / virtualPriorBalance
+    Strategy->>Strategy: totalShares += newShares
+    Strategy-->>StrategyMgr: return newShares
+    deactivate Strategy
+
+    StrategyMgr->>StrategyMgr: _addShares(user, strategy, shares)
+    StrategyMgr->>StrategyMgr: stakerStrategyShares[user][strategy] += shares
     StrategyMgr->>StrategyMgr: 添加 strategy 到 stakerStrategyList[user]
-    StrategyMgr-->>L2Bridge: emit Deposit(user, strategy, 份额)
-    deactivate StrategyMgr
 
-    L2Bridge-->>Relayer: emit BridgeFinalized(user, dETH数量)
-    deactivate L2Bridge
-
-    Note over User,Operator: 阶段 3: L2 委托 (可选)
-
-    User->>DelegationMgr: delegateTo(operator, approverSignature)
+    StrategyMgr->>DelegationMgr: increaseDelegatedShares(user, strategy, shares)
     activate DelegationMgr
-    DelegationMgr->>DelegationMgr: 检查 operator 是否已注册
-    DelegationMgr->>DelegationMgr: 检查 user 未委托给其他人
-    DelegationMgr->>DelegationMgr: delegatedTo[user] = operator
-
-    DelegationMgr->>StrategyMgr: getStakerStrategyList(user)
-    activate StrategyMgr
-    StrategyMgr-->>DelegationMgr: return strategies[]
-    deactivate StrategyMgr
-
-    loop 遍历用户的所有策略
-        DelegationMgr->>StrategyMgr: getStakerStrategyShares(user, strategy)
-        activate StrategyMgr
-        StrategyMgr-->>DelegationMgr: return 份额
-        deactivate StrategyMgr
-        DelegationMgr->>DelegationMgr: operatorShares[operator][strategy] += 份额
+    DelegationMgr->>DelegationMgr: 检查用户是否已委托
+    alt 用户已委托
+        DelegationMgr->>DelegationMgr: operator = delegatedTo[user]
+        DelegationMgr->>DelegationMgr: operatorShares[operator][strategy] += shares
     end
-
-    DelegationMgr-->>User: emit StakerDelegated(user, operator)
     deactivate DelegationMgr
 
-    Note over User,Operator: 完成! 用户已质押并委托
+    StrategyMgr-->>User: emit Deposit(user, ETH, strategy, shares)
+    deactivate StrategyMgr
+
+    Note over User,Operator: 阶段 2: L2 委托 (可选)
+
+    opt 用户选择委托
+        User->>DelegationMgr: delegateTo(operator, approverSignature)
+        activate DelegationMgr
+        DelegationMgr->>DelegationMgr: 检查 operator 是否已注册
+        DelegationMgr->>DelegationMgr: 检查 user 未委托给其他人
+        DelegationMgr->>DelegationMgr: delegatedTo[user] = operator
+
+        loop 遍历用户的所有策略
+            DelegationMgr->>StrategyMgr: getStakerStrategyShares(user, strategy)
+            activate StrategyMgr
+            StrategyMgr-->>DelegationMgr: return 份额
+            deactivate StrategyMgr
+            DelegationMgr->>DelegationMgr: operatorShares[operator][strategy] += 份额
+        end
+
+        DelegationMgr-->>User: emit StakerDelegated(user, operator)
+        deactivate DelegationMgr
+    end
+
+    Note over User,L1Bridge: 阶段 3: 跨链桥接 ETH 到 L1
+
+    Relayer->>Strategy: transferETHToL2DappLinkBridge(sourceChainId, destChainId, bridge, l1StakingManager, batchId, gasLimit)
+    activate Strategy
+    Strategy->>Strategy: 检查余额 >= 32 ETH
+    Strategy->>Strategy: amountBridge = (balance / 32e18) * 32e18
+    Strategy->>Strategy: nextNonce++
+
+    Strategy->>L2Bridge: BridgeInitiateETH(sourceChainId, destChainId, l1StakingManager) {value: amountBridge}
+    activate L2Bridge
+    L2Bridge->>L2Bridge: 记录跨链消息
+    L2Bridge-->>Strategy: emit BridgeInitiated(...)
+    deactivate L2Bridge
+
+    Strategy-->>Relayer: emit TransferETHToL2DappLinkBridge(sourceChainId, destChainId, bridge, l1StakingManager, ETH, amountBridge, batchId, nonce)
+    deactivate Strategy
+
+    Note over Relayer: Relayer 监听事件并中继到 L1
+
+    Relayer->>L1Bridge: BridgeFinalizeETH(sourceChainId, destChainId, to, amount, messageHash, proof)
+    activate L1Bridge
+    L1Bridge->>L1Bridge: 验证消息哈希和证明
+    L1Bridge->>StakingMgr: call{value: amount}("")
+    activate StakingMgr
+    StakingMgr->>StakingMgr: 接收 ETH
+    deactivate StakingMgr
+    L1Bridge-->>Relayer: emit BridgeFinalized(...)
+    deactivate L1Bridge
+
+    Note over Relayer,DETH: 阶段 4: L1 批量质押和铸造 dETH
+
+    Relayer->>StakingMgr: stake(stakeAmount, batchMints[])
+    activate StakingMgr
+    StakingMgr->>StakingMgr: 检查 isStakingPaused()
+    StakingMgr->>StakingMgr: 检查 msg.value >= minimumDepositAmount
+    StakingMgr->>StakingMgr: 计算 dETHMintAmount = ethToDETH(stakeAmount)
+    StakingMgr->>StakingMgr: 检查 dETHMintAmount + totalSupply <= maximumDETHSupply
+    StakingMgr->>StakingMgr: unallocatedETH += stakeAmount
+
+    StakingMgr->>DETH: batchMint(batchMints[])
+    activate DETH
+    loop 遍历 batchMints 数组
+        DETH->>DETH: _mint(batcher[i].staker, batcher[i].amount)
+        DETH->>DETH: totalSupply += amount
+        DETH->>DETH: balances[staker] += amount
+        DETH-->>StakingMgr: emit Transfer(0x0, staker, amount)
+    end
+    deactivate DETH
+
+    StakingMgr-->>Relayer: emit Staked(bridge, stakeAmount, dETHMintAmount)
+    deactivate StakingMgr
+
+    Note over User,Operator: 完成! 用户在 L2 持有 shares,L1 铸造了 dETH
 ```
 
 ---
 
 ## 详细步骤拆解
 
-### 阶段 1: L1 存款和质押
+### 阶段 1: L2 存款和份额分配
 
-#### 步骤 1: 用户在 L1PoolManager 存入 ETH
+#### 步骤 1: 用户在 L2 StrategyManager 存入 ETH
 
-**合约**: `L1PoolManager.sol`
-**函数**: `DepositAndStakingETH()`
-**文件位置**: `src/bridge/core/L1/L1PoolManager.sol`
+**合约**: `StrategyManager.sol`
+**函数**: `depositETHIntoStrategy(address strategy)`
+**文件位置**: `src/L2/core/StrategyManager.sol:91-99`
 
 ```solidity
-function DepositAndStakingETH() external payable whenNotPaused returns (bool) {
-    // 接收用户的 ETH
-    payable(address(this)).transfer(msg.value);
+function depositETHIntoStrategy(
+    address strategy
+) external payable nonReentrant returns (uint256 shares) {
+    // 检查策略存款是否暂停
+    require(getL2Pauser().isStrategyDeposit(), "StrategyManager.t.sol:depositETHIntoStrategy paused");
 
-    // 触发存款事件
-    emit DepositETH(msg.sender, msg.value);
+    // 调用内部函数处理存款
+    shares = _depositETHIntoStrategy(msg.sender, strategy);
+}
+```
+
+**状态变化**:
+- 用户的 ETH 转入 Strategy 合约
+- 触发 `Deposit` 事件
+
+**前置条件**:
+- 合约未暂停 (`isStrategyDeposit()`)
+- 策略已加入白名单 (`strategyIsWhitelistedForDeposit[strategy]`)
+- 用户发送 ETH (`msg.value > 0`)
+
+---
+
+#### 步骤 2: Strategy 计算并分配份额
+
+**合约**: `StrategyBase.sol`
+**函数**: `deposit(IERC20 weth, uint256 amount)`
+**文件位置**: `src/L2/strategies/StrategyBase.sol:91-116`
+
+```solidity
+function deposit(IERC20 weth, uint256 amount)
+    external
+    virtual
+    override
+    onlyStrategyManager
+    returns (uint256 newShares)
+{
+    require(pauser.isStrategyDeposit(), "StrategyBase:deposit paused");
+
+    _beforeDeposit(weth, amount);
+
+    // 1. 记录存款前的总份额
+    uint256 priorTotalShares = totalShares;
+
+    // 2. 计算虚拟份额总量（防止除零和通胀攻击）
+    uint256 virtualShareAmount = priorTotalShares + SHARES_OFFSET;
+
+    // 3. 计算虚拟代币余额（当前余额已包含刚转入的 amount）
+    uint256 virtualTokenBalance = ethWethBalance() + BALANCE_OFFSET;
+
+    // 4. 计算存款前的虚拟余额
+    uint256 virtualPriorTokenBalance = virtualTokenBalance - amount;
+
+    // 5. 新份额 = (本次质押 × 虚拟份额总量) ÷ 存款前虚拟余额
+    newShares = (amount * virtualShareAmount) / virtualPriorTokenBalance;
+
+    require(newShares != 0, "StrategyBase.deposit: newShares cannot be zero");
+
+    // 6. 更新总份额
+    totalShares = (priorTotalShares + newShares);
+    return newShares;
+}
+```
+
+**关键特性**:
+- ⭐ **虚拟余额机制**: 使用 `SHARES_OFFSET` (1e3) 和 `BALANCE_OFFSET` (1e3) 防止通胀攻击
+- ⭐ **汇率计算**: 份额价值随策略收益浮动
+- ⭐ **仅限 StrategyManager 调用**: `onlyStrategyManager` 修饰符
+
+**份额计算示例**:
+```
+初始状态:
+- totalShares = 0
+- 合约余额 = 0
+- SHARES_OFFSET = 1000, BALANCE_OFFSET = 1000
+
+用户 A 存入 10 ETH:
+- virtualShareAmount = 0 + 1000 = 1000
+- virtualTokenBalance = 10 + 1000 = 1010
+- virtualPriorBalance = 1010 - 10 = 1000
+- newShares = (10 × 1000) / 1000 = 10
+- totalShares = 10
+
+策略产生 2 ETH 收益:
+- totalShares = 10 (不变)
+- 合约余额 = 12 ETH
+- 每份额价值 = 12 / 10 = 1.2 ETH
+
+用户 B 存入 12 ETH:
+- virtualShareAmount = 10 + 1000 = 1010
+- virtualTokenBalance = 24 + 1000 = 1024
+- virtualPriorBalance = 1024 - 12 = 1012
+- newShares = (12 × 1010) / 1012 ≈ 11.98
+- totalShares = 21.98
+- 每份额价值 = 24 / 21.98 ≈ 1.09 ETH (略有稀释,但接近 1.2)
+```
+
+---
+
+#### 步骤 3: StrategyManager 记录份额并更新委托
+
+**合约**: `StrategyManager.sol`
+**内部函数**: `_depositETHIntoStrategy()` 和 `_addShares()`
+**文件位置**: `src/L2/core/StrategyManager.sol:357-373, 308-325`
+
+```solidity
+function _depositETHIntoStrategy(
+    address staker,
+    address strategy
+) internal onlyStrategiesWhitelistedForDeposit(strategy) returns (uint256 shares) {
+    // 1. 将 ETH 转入对应的 strategy
+    (bool sent, ) = payable(strategy).call{value: msg.value}("");
+    require(sent, "StrategyManager._depositETHIntoStrategy: send eth to strategy fail");
+
+    // 2. 调用策略合约的 deposit 方法计算份额
+    shares = getStrategy(strategy).deposit(IERC20(ETHAddress.EthAddress), msg.value);
+
+    // 3. 将 shares 加给 staker
+    _addShares(staker, IERC20(ETHAddress.EthAddress), strategy, shares);
+
+    // 4. 若 staker 已经 delegate,将 staker 质押 shares 委托给对应的 operator
+    getDelegationManager().increaseDelegatedShares(staker, strategy, shares);
+
+    return shares;
+}
+
+function _addShares(address staker, IERC20 weth, address strategy, uint256 shares) internal {
+    require(staker != address(0), "StrategyManager._addShares: staker cannot be zero address");
+    require(shares != 0, "StrategyManager._addShares: shares should not be zero!");
+
+    // 如果是新策略,添加到质押者的策略列表
+    if (stakerStrategyShares[staker][strategy] == 0) {
+        require(
+            stakerStrategyList[staker].length < MAX_STAKER_STRATEGY_LIST_LENGTH,
+            "StrategyManager._addShares: deposit would exceed MAX_STAKER_STRATEGY_LIST_LENGTH"
+        );
+        stakerStrategyList[staker].push(strategy);
+    }
+
+    // 增加份额
+    stakerStrategyShares[staker][strategy] += shares;
+
+    emit Deposit(staker, weth, strategy, shares);
+}
+```
+
+**状态变化**:
+- `stakerStrategyShares[staker][strategy]` 增加 `shares`
+- 如果是新策略,添加到 `stakerStrategyList[staker]`
+- 如果用户已委托,`operatorShares[operator][strategy]` 增加 `shares`
+
+---
+
+### 阶段 2: L2 委托 (可选)
+
+#### 步骤 4: 用户委托给运营商
+
+**合约**: `DelegationManager.sol`
+**函数**: `delegateTo(address operator, SignatureWithExpiry memory approverSignatureAndExpiry, bytes32 approverSalt)`
+**文件位置**: `src/L2/core/DelegationManager.sol:69-73`
+
+```solidity
+function delegateTo(
+    address operator,
+    SignatureWithExpiry memory approverSignatureAndExpiry,
+    bytes32 approverSalt
+) external {
+    _delegate(msg.sender, operator, approverSignatureAndExpiry, approverSalt);
+}
+
+function _delegate(
+    address staker,
+    address operator,
+    SignatureWithExpiry memory approverSignatureAndExpiry,
+    bytes32 approverSalt
+) internal {
+    // 1. 检查运营商是否已注册
+    require(isOperator(operator), "Operator not registered");
+
+    // 2. 检查质押者未委托给其他人
+    require(!isDelegated(staker), "Already delegated");
+
+    // 3. 验证运营商签名(如果需要批准)
+    if (_operatorDetails[operator].delegationApprover != address(0)) {
+        _verifyApproverSignature(
+            staker,
+            operator,
+            approverSignatureAndExpiry,
+            approverSalt
+        );
+    }
+
+    // 4. 设置委托关系
+    delegatedTo[staker] = operator;
+
+    // 5. 增加运营商的份额
+    _increaseDelegatedShares(staker, operator);
+
+    // 6. 触发事件
+    emit StakerDelegated(staker, operator);
+}
+
+function _increaseDelegatedShares(
+    address staker,
+    address operator
+) internal {
+    // 获取质押者的所有策略
+    address[] memory strategies = strategyManager.getStakerStrategyList(staker);
+
+    // 遍历增加运营商份额
+    for (uint256 i = 0; i < strategies.length; i++) {
+        address strategy = strategies[i];
+        uint256 shares = strategyManager.getStakerStrategyShares(staker, strategy);
+
+        operatorShares[operator][strategy] += shares;
+
+        emit OperatorSharesIncreased(operator, staker, strategy, shares);
+    }
+}
+```
+
+**状态变化**:
+- `delegatedTo[staker]` 设置为 `operator`
+- 对于质押者的每个策略:
+  - `operatorShares[operator][strategy]` 增加相应份额
+
+**前置条件**:
+- ✅ 运营商已调用 `registerAsOperator()` 注册
+- ✅ 质押者未委托给其他运营商
+- ✅ 如果运营商设置了 `delegationApprover`,需要提供有效签名
+
+---
+
+### 阶段 3: 跨链桥接 ETH 到 L1
+
+#### 步骤 5: Relayer 触发策略合约转移 ETH 到 L1
+
+**合约**: `StrategyBase.sol`
+**函数**: `transferETHToL2DappLinkBridge(...)`
+**文件位置**: `src/L2/strategies/StrategyBase.sol:227-263`
+
+```solidity
+function transferETHToL2DappLinkBridge(
+    uint256 sourceChainId,
+    uint256 destChainId,
+    address bridge,
+    address l1StakingManagerAddr,
+    uint256 batchId,
+    uint256 gasLimit
+) external payable onlyRelayer returns (bool) {
+    // 检查余额是否达到 32 ETH
+    if (address(this).balance > 32e18) {
+        // 计算可桥接金额(必须是 32 的整数倍)
+        uint256 amountBridge = ((address(this).balance) / 32e18) * 32e18;
+        nextNonce++;
+
+        // 调用 bridge 合约 BridgeInitiateETH,将资金转移到 L1 层
+        bool success = SafeCall.callWithMinGas(
+            bridge,
+            gasLimit,
+            amountBridge,
+            abi.encodeWithSignature(
+                "BridgeInitiateETH(uint256,uint256,address)",
+                sourceChainId,
+                destChainId,
+                l1StakingManagerAddr
+            )
+        );
+        require(success, "StrategyBase.transferETHToL2DappLinkBridge: transfer failed");
+
+        emit TransferETHToL2DappLinkBridge(
+            sourceChainId,
+            destChainId,
+            bridge,
+            l1StakingManagerAddr,
+            ETHAddress.EthAddress,
+            amountBridge,
+            batchId,
+            nextNonce
+        );
+        return success;
+    }
+    return false;
+}
+```
+
+**关键特性**:
+- ⭐ **批量处理**: 只有当余额 > 32 ETH 时才触发跨链
+- ⭐ **32 ETH 对齐**: 转移金额必须是 32 ETH 的整数倍
+- ⭐ **仅限 Relayer 调用**: `onlyRelayer` 修饰符
+- ⭐ **Nonce 递增**: 每次跨链转移增加 nonce,确保唯一性
+
+**状态变化**:
+- Strategy 合约余额减少 `amountBridge`
+- L2 TokenBridge 记录跨链消息
+- `nextNonce` 递增
+
+---
+
+#### 步骤 6: L2 TokenBridge 发起跨链消息
+
+**合约**: `TokenBridgeBase.sol` (L2 实例)
+**函数**: `BridgeInitiateETH(uint256 sourceChainId, uint256 destChainId, address to)`
+**文件位置**: `src/bridge/core/bridge/TokenBridgeBase.sol:194-216`
+
+```solidity
+function BridgeInitiateETH(
+    uint256 sourceChainId,
+    uint256 destChainId,
+    address to
+) external payable returns (bool) {
+    require(msg.value > 0, "TokenBridge.BridgeInitiateETH: Cannot send 0 value");
+
+    // 生成消息哈希
+    bytes32 messageHash = keccak256(
+        abi.encode(
+            sourceChainId,
+            destChainId,
+            to,
+            msg.value,
+            messageNumber
+        )
+    );
+
+    // 触发事件供 Relayer 监听
+    emit InitiateETH(
+        sourceChainId,
+        destChainId,
+        to,
+        msg.value,
+        messageNumber,
+        messageHash
+    );
+
+    messageNumber++;
+    return true;
+}
+```
+
+**状态变化**:
+- Bridge 合约接收 ETH
+- 生成跨链消息哈希
+- `messageNumber` 递增
+
+---
+
+#### 步骤 7: Relayer 中继消息到 L1
+
+**操作者**: Relayer (链下服务)
+**流程**:
+
+1. **监听 L2 事件**:
+```javascript
+// Relayer 伪代码
+l2Bridge.on('InitiateETH', async (sourceChainId, destChainId, to, amount, nonce, messageHash) => {
+    const proof = await generateProof(event);
+
+    // 中继到 L1
+    await relayMessageToL1(messageHash, proof);
+});
+```
+
+2. **在 L1 完成资金转移**:
+```javascript
+// Relayer 调用 L1Bridge.BridgeFinalizeETH()
+await l1Bridge.BridgeFinalizeETH(
+    sourceChainId,
+    destChainId,
+    to,  // L1 StakingManager 地址
+    amount,
+    messageHash,
+    proof
+);
+```
+
+---
+
+### 阶段 4: L1 批量质押和铸造 dETH
+
+#### 步骤 8: L1 TokenBridge 完成跨链并转 ETH 到 StakingManager
+
+**合约**: `TokenBridgeBase.sol` (L1 实例)
+**函数**: `BridgeFinalizeETH(...)`
+**文件位置**: `src/bridge/core/bridge/TokenBridgeBase.sol:218-244`
+
+```solidity
+function BridgeFinalizeETH(
+    uint256 sourceChainId,
+    uint256 destChainId,
+    address to,
+    uint256 amount,
+    bytes32 messageHash,
+    bytes memory proof
+) external returns (bool) {
+    // 验证消息哈希
+    bytes32 computedHash = keccak256(
+        abi.encode(sourceChainId, destChainId, to, amount, messageNumber)
+    );
+    require(computedHash == messageHash, "Invalid message hash");
+
+    // 转移 ETH 到目标地址
+    (bool success, ) = to.call{value: amount}("");
+    require(success, "TokenBridge.BridgeFinalizeETH: transfer failed");
+
+    emit FinalizeETH(
+        sourceChainId,
+        destChainId,
+        to,
+        amount,
+        messageNumber,
+        messageHash
+    );
 
     return true;
 }
 ```
 
 **状态变化**:
-- L1PoolManager 合约余额增加 `msg.value` ETH
-- 触发 `DepositETH(msg.sender, msg.value)` 事件
-
-**前置条件**:
-- 合约未暂停 (`whenNotPaused`)
-- 用户发送 ETH (`msg.value > 0`)
+- ETH 从 Bridge 转入 StakingManager
+- 触发 `FinalizeETH` 事件
 
 ---
 
-#### 步骤 2: Relayer 触发质押
-
-**合约**: `L1PoolManager.sol`
-**函数**: `BridgeFinalizeETHForStaking(address staker, uint256 amount)`
-**调用者**: Relayer (监听 `DepositETH` 事件后触发)
-
-```solidity
-function BridgeFinalizeETHForStaking(
-    address staker,
-    uint256 amount
-) external onlyRelayer whenNotPaused returns (bool) {
-    // 调用 StakingManager 执行质押
-    getStakingManager().stake{value: amount}(staker);
-
-    return true;
-}
-```
-
-**权限检查**:
-- 仅 Relayer 可调用 (`onlyRelayer`)
-- 合约未暂停
-
----
-
-#### 步骤 3: StakingManager 批量铸造 dETH
+#### 步骤 9: Relayer 调用 StakingManager 批量铸造 dETH
 
 **合约**: `StakingManager.sol`
-**函数**: `stake(uint256 stakeAmount, IDETH.BatchMint[] calldata batchMints) payable`
-**文件位置**: `src/L1/core/StakingManager.sol:138-157`
+**函数**: `stake(uint256 stakeAmount, IDETH.BatchMint[] calldata batchMints)`
+**文件位置**: `src/L1/core/StakingManager.sol:137-156`
 
 ```solidity
-function stake(uint256 stakeAmount, IDETH.BatchMint[] calldata batchMints) external onlyDappLinkBridge payable {
+function stake(uint256 stakeAmount, IDETH.BatchMint[] calldata batchMints)
+    external
+    onlyDappLinkBridge
+    payable
+{
     // 1. 检查暂停状态
     if (getL1Pauser().isStakingPaused()) {
         revert Paused();
@@ -248,15 +641,33 @@ function stake(uint256 stakeAmount, IDETH.BatchMint[] calldata batchMints) exter
 ```solidity
 // DETH.sol
 struct BatchMint {
-    address recipient;  // dETH 接收者地址
-    uint256 amount;     // 铸造的 dETH 数量
+    address staker;  // dETH 接收者地址
+    uint256 amount;  // 铸造的 dETH 数量
+}
+```
+
+**DETH.batchMint() 实现** (DETH.sol:65-72):
+```solidity
+function batchMint(BatchMint[] calldata batcher) external {
+    if (msg.sender != getLocator().stakingManager()) {
+        revert NotStakingManagerContract();
+    }
+    for (uint256 i = 0; i < batcher.length; i++) {
+        _mint(batcher[i].staker, batcher[i].amount);
+    }
 }
 ```
 
 **状态变化**:
 - `StakingManager.unallocatedETH` 增加 `stakeAmount`
 - `DETH.totalSupply` 增加 `dETHMintAmount`
-- `DETH.balances[recipient]` 根据 `batchMints` 数组批量增加
+- `DETH.balances[staker]` 根据 `batchMints` 数组批量增加
+
+**关键差异**:
+- ⭐ **仅限桥接调用**: 使用 `onlyDappLinkBridge` 修饰符,不是公开函数
+- ⭐ **批量铸造**: 支持一次性给多个地址铸造 dETH
+- ⭐ **两个金额参数**: `msg.value` 和 `stakeAmount` 都需要检查
+- ⭐ **事件发送者**: emit 事件时使用 bridge 地址
 
 **关键计算 - dETH 数量**:
 ```solidity
@@ -268,13 +679,40 @@ function ethToDETH(uint256 ethAmount) public returns (uint256) {
     // dETH 数量 = ethAmount * totalSupply / totalControlled
     return Math.mulDiv(ethAmount, getDETH().totalSupply(), totalControlled());
 }
+
+// totalControlled() 聚合多个来源的 ETH
+function totalControlled() public view returns (uint256) {
+    return unallocatedETH
+         + allocatedETHForDeposits
+         + totalDepositedInValidators
+         + unstakeRequestsManager.unallocatedETH()
+         + oracleManager.latestRecord().currentTotalValidatorBalance;
+}
 ```
 
-**关键差异**:
-- ⭐ **仅限桥接调用**: 使用 `onlyDappLinkBridge` 修饰符,不是公开函数
-- ⭐ **批量铸造**: 支持一次性给多个地址铸造 dETH
-- ⭐ **两个金额参数**: `msg.value` 和 `stakeAmount` 都需要检查
-- ⭐ **事件发送者**: emit 事件时使用 bridge 地址而非 staker
+**汇率示例**:
+```
+初始状态:
+- totalControlled = 0
+- dETH totalSupply = 0
+- 汇率 = 1:1
+
+批次 1: 3 个用户共存入 96 ETH (32×3):
+- 铸造 96 dETH
+- totalControlled = 96 ETH
+- dETH totalSupply = 96
+- 汇率 = 96/96 = 1:1
+
+验证者产生 3 ETH 奖励:
+- totalControlled = 99 ETH
+- dETH totalSupply = 96 (不变)
+- 汇率 = 99/96 = 1.03125 ETH per dETH
+
+批次 2: 2 个用户存入 64 ETH (32×2):
+- 应铸造 dETH = 64 * (96/99) ≈ 61.82 dETH
+- totalControlled = 163 ETH
+- dETH totalSupply ≈ 157.82
+```
 
 **安全检查**:
 - ✅ 最小质押金额检查 (`minimumDepositAmount`)
@@ -284,463 +722,145 @@ function ethToDETH(uint256 ethAmount) public returns (uint256) {
 
 ---
 
-### 阶段 2: 跨链桥接 dETH 份额
-
-#### 步骤 4: 用户转移 dETH 触发跨链消息
-
-**合约**: `DETH.sol`
-**函数**: `transfer(address to, uint256 value)`
-**文件位置**: `src/L1/core/DETH.sol:103-116`
-
-```solidity
-function transfer(address to, uint256 value) override(ERC20Upgradeable, IERC20) public returns (bool) {
-    address owner = _msgSender();
-
-    // 1. 执行 ERC20 转账
-    _transfer(owner, to, value);
-
-    // 2. ⭐ 通过 SafeCall 发送跨链质押消息
-    bool success = SafeCall.callWithMinGas(
-        bridgeAddress,
-        200000,  // gas limit
-        0,       // value (不发送 ETH)
-        abi.encodeWithSignature("BridgeInitiateStakingMessage(address,address,uint256)", owner, to, value)
-    );
-
-    if (!success) {
-        revert BridgeStakingMessageInitFailed();
-    }
-
-    return true;
-}
-```
-
-**关键特性**:
-- ⭐ **直接调用桥接**: 使用 `SafeCall.callWithMinGas()` 而非内部函数
-- ⭐ **3 个参数**: `BridgeInitiateStakingMessage(address from, address to, uint256 shares)`
-- ⭐ **包含 from 地址**: 与之前文档描述不同,实际包含转出地址
-- ⭐ **Gas 限制**: 固定 200000 gas
-- ⭐ **失败回滚**: 如果桥接消息发送失败,整个转账回滚
-
-**TokenBridge.BridgeInitiateStakingMessage()** (TokenBridgeBase.sol:274-291):
-```solidity
-function BridgeInitiateStakingMessage(
-    address from,
-    address to,
-    uint256 shares
-) external returns (bool) {
-    // 生成质押消息哈希
-    bytes32 stakingMessageHash = keccak256(
-        abi.encode(from, to, shares, stakingMessageNumber)
-    );
-
-    // 触发事件供 Relayer 监听
-    emit InitiateStakingMessage(
-        from,
-        to,
-        shares,
-        stakingMessageNumber,
-        stakingMessageHash
-    );
-
-    stakingMessageNumber++;
-    return true;
-}
-```
-
-**状态变化**:
-- `DETH.balances[owner]` 减少 `value`
-- `DETH.balances[to]` 增加 `value`
-- 生成跨链消息哈希
-- `stakingMessageNumber` 递增
-
-**注意事项**:
-- ⚠️ 每次 dETH 转账都会触发跨链消息
-- ⚠️ 转账目标地址 `to` 通常是用户在 L2 的地址
-- ⚠️ 需要 Relayer 中继消息才能在 L2 生效
-- ⭐ **不发送实际 ETH**: 只发送消息,ETH 已在 StakingManager 中
-
----
-
-#### 步骤 5: Relayer 中继消息到 L2
-
-**操作者**: Relayer (链下服务)
-**流程**:
-
-1. **监听 L1 事件**:
-```javascript
-// Relayer 伪代码
-l1Bridge.on('InitiateStakingMessage', async (from, to, shares, nonce, messageHash) => {
-    const messageHash = event.transactionHash;
-    const proof = await generateProof(event);
-
-    // 中继到 L2
-    await relayMessageToL2(messageHash, proof);
-});
-```
-
-2. **在 L2 完成份额转移**:
-```javascript
-// Relayer 调用 L2Bridge.BridgeFinalizeStakingMessage()
-await l2Bridge.BridgeFinalizeStakingMessage(
-    shareAddress,  // Strategy 合约地址
-    from,
-    to,
-    shares,
-    nonce,
-    gasLimit
-);
-```
-
----
-
-#### 步骤 6: L2 桥接合约调用 Strategy 转移份额
-
-**合约**: `TokenBridgeBase.sol` (L2 实例)
-**函数**: `BridgeFinalizeStakingMessage(address shareAddress, address from, address to, uint256 shares, uint256 stakeMessageNonce, uint256 gasLimit)`
-**文件位置**: `src/bridge/core/bridge/TokenBridgeBase.sol:442-478`
-
-```solidity
-function BridgeFinalizeStakingMessage(
-    address shareAddress,  // Strategy 合约地址
-    address from,
-    address to,
-    uint256 shares,
-    uint256 stakeMessageNonce,
-    uint256 gasLimit
-) external returns (bool) {
-    // 1. 验证消息哈希
-    bytes32 stakingMessageHash = keccak256(
-        abi.encode(from, to, shares, stakeMessageNonce)
-    );
-
-    // 2. ⭐ 通过 SafeCall 调用 Strategy.TransferShareTo()
-    bool success = SafeCall.callWithMinGas(
-        shareAddress,
-        gasLimit,
-        0,
-        abi.encodeWithSignature(
-            "TransferShareTo(address,address,uint256,uint256)",
-            from,
-            to,
-            shares,
-            stakeMessageNonce
-        )
-    );
-
-    require(
-        success,
-        "TokenBridge.BridgeFinalizeStakingMessage: call failed"
-    );
-
-    // 3. 触发事件
-    emit FinalizeStakingMessage(
-        from,
-        to,
-        shareAddress,
-        shares,
-        stakeMessageNonce,
-        stakingMessageHash
-    );
-
-    return true;
-}
-```
-
-**关键特性**:
-- ⭐ **直接调用 Strategy**: 不经过 StrategyManager
-- ⭐ **消息哈希验证**: 在 Strategy 内部验证
-- ⭐ **防重放**: 使用 `stakeMessageNonce` 确保唯一性
-
----
-
-#### 步骤 7: Strategy 转移份额
-
-**合约**: `StrategyBase.sol`
-**函数**: `TransferShareTo(address from, address to, uint256 shares, uint256 stakeNonce)`
-**文件位置**: `src/L2/strategies/StrategyBase.sol:315-320`
-
-```solidity
-function TransferShareTo(address from, address to, uint256 shares, uint256 stakeNonce) external {
-    // 1. 重新计算消息哈希进行验证
-    bytes32 sakeMessageHash = keccak256(abi.encode(from, to, shares, stakeNonce));
-
-    // 2. ⭐ 验证哈希匹配(防止重复执行)
-    if (sakeMessageHash == stakeMessageHashRelate[stakeNonce]) {
-        // 3. 调用 StrategyManager 转移份额
-        strategyManager.transferStakerStrategyShares(address(this), from, to, shares);
-    }
-}
-```
-
-**StrategyManager.transferStakerStrategyShares()** (StrategyManager.sol:531-535):
-```solidity
-function transferStakerStrategyShares(address strategy, address from, address to, uint256 shares) external returns (bool) {
-    stakerStrategyShares[from][strategy] -= shares;
-    stakerStrategyShares[to][strategy] += shares;
-    return true;
-}
-```
-
-**状态变化**:
-- `stakerStrategyShares[from][strategy]` 减少 `shares`
-- `stakerStrategyShares[to][strategy]` 增加 `shares`
-- **⭐ 不改变 totalShares**: 只是份额所有权转移
-
-**重要注意**:
-- ⭐ **防止套娃**: 注释中提到"防止重复套娃",确保 L1 的 dETH 转账不会在 L2 重复触发转账
-- ⭐ **哈希预存储**: Relayer 需要先调用 `updateStakeMessageHash()` 存储消息哈希
-- ⭐ **验证后才执行**: 只有消息哈希匹配时才转移份额
-
----
-
-#### 步骤 8: Relayer 更新消息哈希映射
-
-**合约**: `StrategyBase.sol`
-**函数**: `updateStakeMessageHash(uint256 stakeMessageNonce, bytes32 stakeMsgHash)`
-**文件位置**: `src/L2/strategies/StrategyBase.sol:309-312`
-
-```solidity
-function updateStakeMessageHash(uint256 stakeMessageNonce, bytes32 stakeMsgHash) external onlyRelayer {
-    stakeMessageHashRelate[stakeMessageNonce] = stakeMsgHash;
-    emit StakeMessageHashRelate(stakeMessageNonce, stakeMsgHash);
-}
-```
-
-**Relayer 工作流程**:
-```javascript
-// 1. 监听 L1 事件
-l1Bridge.on('InitiateStakingMessage', async (from, to, shares, nonce, messageHash) => {
-    // 2. 先在 Strategy 中存储消息哈希
-    await l2Strategy.updateStakeMessageHash(nonce, messageHash);
-
-    // 3. 然后调用桥接完成份额转移
-    await l2Bridge.BridgeFinalizeStakingMessage(
-        l2Strategy,
-        from,
-        to,
-        shares,
-        nonce,
-        gasLimit
-    );
-});
-```
-
----
-
-### 阶段 3: L2 策略委托 (可选)
-
-#### 步骤 9: 用户委托给运营商
-    uint256 priorBalance = underlyingToken.balanceOf(address(this));
-
-    if (priorTotalShares == 0) {
-        shares = amount;  // 初始汇率 1:1
-    } else {
-        // 份额 = amount * (总份额 / 合约余额)
-        shares = (amount * priorTotalShares) / priorBalance;
-    }
-
-    totalShares += shares;
-    shares[staker] += shares;
-
-    emit Deposit(staker, amount, shares);
-    return shares;
-}
-```
-
----
-
-### 阶段 3: L2 委托 (可选)
-
-#### 步骤 9: 用户委托给运营商
-
-**合约**: `DelegationManager.sol`
-**函数**: `delegateTo(address operator, SignatureWithExpiry memory approverSignatureAndExpiry, bytes32 approverSalt)`
-**文件位置**: `src/L2/core/DelegationManager.sol`
-
-```solidity
-function delegateTo(
-    address operator,
-    SignatureWithExpiry memory approverSignatureAndExpiry,
-    bytes32 approverSalt
-) external {
-    // 1. 检查运营商是否已注册
-    require(isOperator(operator), "Operator not registered");
-
-    // 2. 检查质押者未委托给其他人
-    require(!isDelegated(msg.sender), "Already delegated");
-
-    // 3. 验证运营商签名(如果需要批准)
-    if (operatorDetails[operator].delegationApprover != address(0)) {
-        _verifyApproverSignature(
-            msg.sender,
-            operator,
-            approverSignatureAndExpiry,
-            approverSalt
-        );
-    }
-
-    // 4. 设置委托关系
-    delegatedTo[msg.sender] = operator;
-
-    // 5. 增加运营商的份额
-    _increaseDelegatedShares(msg.sender, operator);
-
-    // 6. 触发事件
-    emit StakerDelegated(msg.sender, operator);
-}
-
-function _increaseDelegatedShares(
-    address staker,
-    address operator
-) internal {
-    // 获取质押者的所有策略
-    address[] memory strategies = strategyManager.getStakerStrategyList(staker);
-
-    // 遍历增加运营商份额
-    for (uint256 i = 0; i < strategies.length; i++) {
-        address strategy = strategies[i];
-        uint256 shares = strategyManager.getStakerStrategyShares(staker, strategy);
-
-        operatorShares[operator][strategy] += shares;
-
-        emit OperatorSharesIncreased(operator, staker, strategy, shares);
-    }
-}
-```
-
-**状态变化**:
-- `DelegationManager.delegatedTo[staker]` 设置为 `operator`
-- 对于质押者的每个策略:
-  - `DelegationManager.operatorShares[operator][strategy]` 增加相应份额
-
-**前置条件**:
-- ✅ 运营商已调用 `registerAsOperator()` 注册
-- ✅ 质押者未委托给其他运营商
-- ✅ 如果运营商设置了 `delegationApprover`,需要提供有效签名
-
----
-
 ## 关键函数详解
 
-### 1. dETH 汇率计算
+### 1. L2 Strategy 份额计算 - 虚拟余额防通胀攻击
 
-**函数**: `DETH.dETHToETH(uint256 dETHAmount)` 和 `DETH.ethToDETH(uint256 ethAmount)`
+**函数**: `StrategyBase.deposit()`
+**位置**: `src/L2/strategies/StrategyBase.sol:91-116`
+
+**核心公式**:
+```solidity
+virtualShareAmount = totalShares + SHARES_OFFSET;  // 虚拟份额总量
+virtualTokenBalance = ethWethBalance() + BALANCE_OFFSET;  // 虚拟资产余额
+virtualPriorBalance = virtualTokenBalance - amount;  // 存款前虚拟余额
+
+newShares = (amount * virtualShareAmount) / virtualPriorBalance;
+```
+
+**为什么需要虚拟余额?**
+
+传统的份额计算公式:
+```solidity
+shares = (amount * totalShares) / totalAssets;
+```
+
+存在通胀攻击风险:
+1. 攻击者首存 1 wei,获得 1 份额
+2. 攻击者直接转入 1000 ETH 到合约(不通过 deposit)
+3. 现在 totalShares = 1, totalAssets = 1000 ETH + 1 wei
+4. 受害者存入 999 ETH:
+   - shares = (999 ETH * 1) / (1000 ETH + 1 wei) ≈ 0 (向下取整)
+   - 受害者损失全部资金!
+
+**虚拟余额机制解决方案**:
+- 使用 `SHARES_OFFSET = 1000` 和 `BALANCE_OFFSET = 1000`
+- 即使 totalShares = 0,虚拟份额也是 1000
+- 攻击者无法通过小额首存垄断份额
+
+**示例对比**:
+```
+传统方式:
+- 攻击者存入 1 wei,获得 1 份额
+- 攻击者直接转入 1000 ETH
+- 受害者存入 999 ETH,获得 (999 * 1) / 1000 = 0 份额 ❌
+
+虚拟余额方式:
+- 攻击者存入 1 wei,获得 (1 * 1000) / 1000 = 1 份额
+- 攻击者直接转入 1000 ETH
+- virtualShareAmount = 1 + 1000 = 1001
+- virtualTokenBalance = 1000 ETH + 1 wei + 1000 = 1000000000001000001 wei
+- virtualPriorBalance = 1000000000001000001 - 999000000000000000000 = 1000001000001 wei
+- 受害者存入 999 ETH,获得 (999 ETH * 1001) / 1000001000001 ≈ 999 份额 ✅
+```
+
+---
+
+### 2. L1 dETH 汇率计算
+
+**函数**: `StakingManager.ethToDETH()` 和 `dETHToETH()`
 
 ```solidity
 // 获取协议总控制 ETH
-function getTotalControlledETH() public view returns (uint256) {
-    return stakingManager.totalDepositedInValidators()  // 已存入验证者的 ETH
-         + stakingManager.unallocatedETH()              // StakingManager 未分配的 ETH
-         + unstakeRequestsManager.unallocatedETH()      // UnstakeRequestsManager 的 ETH
-         + oracleManager.latestRecord().currentTotalValidatorBalance;  // 验证者当前余额
+function totalControlled() public view returns (uint256) {
+    return unallocatedETH                                           // 未分配的 ETH
+         + allocatedETHForDeposits                                  // 已分配用于验证者的 ETH
+         + totalDepositedInValidators                               // 已存入验证者的 ETH
+         + getUnstakeRequestsManager().unallocatedETH()            // 解质押请求中的 ETH
+         + getOracleManager().latestRecord().currentTotalValidatorBalance;  // 验证者当前余额
 }
 
 // ETH → dETH
 function ethToDETH(uint256 ethAmount) public view returns (uint256) {
-    uint256 totalETH = getTotalControlledETH();
-    uint256 supply = totalSupply();
+    uint256 totalETH = totalControlled();
+    uint256 supply = getDETH().totalSupply();
 
     if (supply == 0) return ethAmount;  // 初始 1:1
 
     // dETH 数量 = ethAmount * (supply / totalETH)
-    return (ethAmount * supply) / totalETH;
+    return Math.mulDiv(ethAmount, supply, totalETH);
 }
 
 // dETH → ETH
 function dETHToETH(uint256 dETHAmount) public view returns (uint256) {
-    uint256 supply = totalSupply();
+    uint256 supply = getDETH().totalSupply();
 
     if (supply == 0) return dETHAmount;
 
     // ETH 数量 = dETHAmount * (totalETH / supply)
-    return (dETHAmount * getTotalControlledETH()) / supply;
+    return Math.mulDiv(dETHAmount, totalControlled(), supply);
 }
 ```
 
-**汇率示例**:
+**汇率变化示例**:
 ```
-初始状态:
-- totalControlledETH = 0
+T0: 协议启动
+- totalControlled = 0
 - dETH totalSupply = 0
 - 汇率 = 1:1
 
-用户 A 存入 32 ETH:
-- 铸造 32 dETH
-- totalControlledETH = 32 ETH
-- dETH totalSupply = 32
-- 汇率 = 32/32 = 1:1
+T1: 10 个用户各存入 32 ETH,共 320 ETH
+- totalControlled = 320 ETH
+- dETH totalSupply = 320
+- 汇率 = 320/320 = 1:1
+- 每个用户持有 32 dETH,价值 32 ETH
 
-验证者产生 1 ETH 奖励:
-- totalControlledETH = 33 ETH
-- dETH totalSupply = 32 (不变)
-- 汇率 = 33/32 = 1.03125 ETH per dETH
+T2: 验证者运行一周,产生 10 ETH 奖励
+- totalControlled = 330 ETH (320 + 10)
+- dETH totalSupply = 320 (不变)
+- 汇率 = 330/320 = 1.03125 ETH per dETH
+- 每个用户的 32 dETH 现在价值 33 ETH
 
-用户 B 存入 32 ETH:
-- 应铸造 dETH = 32 * (32/33) ≈ 31.03 dETH
-- totalControlledETH = 65 ETH
-- dETH totalSupply ≈ 63.03
+T3: 新用户存入 64 ETH
+- 应铸造 dETH = 64 * (320/330) ≈ 62.06 dETH
+- totalControlled = 394 ETH
+- dETH totalSupply ≈ 382.06
+- 汇率 = 394/382.06 ≈ 1.031 ETH per dETH (略微稀释)
 ```
 
 ---
 
-### 2. L2 Strategy 份额计算
+### 3. 批量铸造机制
 
-**函数**: `Strategy.deposit(address staker, uint256 amount)`
+**优势**:
+- ⭐ **Gas 优化**: 一次交易处理多个用户
+- ⭐ **公平性**: 同一批次用户使用相同汇率
+- ⭐ **灵活性**: 可以按比例分配 dETH
 
+**BatchMint 结构**:
 ```solidity
-function deposit(address staker, uint256 amount)
-    external
-    onlyStrategyManager
-    returns (uint256 shares)
-{
-    // 1. 记录当前状态
-    uint256 priorTotalShares = totalShares;
-    uint256 priorBalance = underlyingToken.balanceOf(address(this));
-
-    // 2. 计算份额
-    if (priorTotalShares == 0) {
-        shares = amount;  // 初始汇率 1:1
-    } else {
-        // 份额 = 存入金额 * (总份额 / 合约持有的基础资产)
-        shares = (amount * priorTotalShares) / priorBalance;
-    }
-
-    // 3. 更新状态
-    totalShares += shares;
-    this.shares[staker] += shares;
-
-    // 4. 转入资产(如果是 ERC20 策略)
-    if (address(underlyingToken) != address(0)) {
-        underlyingToken.safeTransferFrom(msg.sender, address(this), amount);
-    }
-
-    emit Deposit(staker, amount, shares);
-    return shares;
+struct BatchMint {
+    address staker;  // 接收者
+    uint256 amount;  // dETH 数量
 }
-```
 
-**份额计算示例**:
-```
-初始状态:
-- totalShares = 0
-- 合约余额 = 0
+// 示例调用
+BatchMint[] memory mints = new BatchMint[](3);
+mints[0] = BatchMint(user1, 32 ether);
+mints[1] = BatchMint(user2, 64 ether);
+mints[2] = BatchMint(user3, 32 ether);
 
-用户 A 存入 10 ETH:
-- shares = 10 (初始 1:1)
-- totalShares = 10
-- 合约余额 = 10 ETH
-
-策略产生 2 ETH 收益:
-- totalShares = 10 (不变)
-- 合约余额 = 12 ETH
-- 每份额价值 = 12 / 10 = 1.2 ETH
-
-用户 B 存入 12 ETH:
-- shares = 12 * (10 / 12) = 10
-- totalShares = 20
-- 合约余额 = 24 ETH
-- 每份额价值 = 24 / 20 = 1.2 ETH (保持不变)
+stakingManager.stake{value: 128 ether}(128 ether, mints);
 ```
 
 ---
@@ -751,53 +871,72 @@ function deposit(address staker, uint256 amount)
 
 ```mermaid
 graph LR
-    subgraph "L1 状态变化"
-        A[L1PoolManager.balance<br/>+ X ETH]
-        B[StakingManager.unallocatedETH<br/>+ X ETH]
-        C[DETH.totalSupply<br/>+ dETH数量]
-        D[DETH.balances用户<br/>+ dETH数量]
-    end
-
     subgraph "L2 状态变化"
-        E[Strategy.totalShares<br/>+ 份额]
-        F[Strategy.shares用户<br/>+ 份额]
-        G[StrategyManager.stakerStrategyShares<br/>+ 份额]
-        H[DelegationManager.operatorShares<br/>+ 份额]
+        A[用户发送 ETH]
+        B[Strategy.totalShares<br/>+ 份额]
+        C[stakerStrategyShares用户<br/>+ 份额]
+        D[operatorShares运营商<br/>+ 份额可选]
+        E[Strategy余额<br/>积累到 32 ETH]
     end
 
-    A -->|Relayer触发| B
-    B -->|铸造dETH| C
-    C -->|分配给用户| D
-    D -->|跨链桥接| E
-    E -->|记录用户份额| F
-    F -->|StrategyManager记录| G
-    G -->|委托| H
+    subgraph "跨链传输"
+        F[Strategy 转 ETH 到 Bridge]
+        G[L2Bridge 发起消息]
+        H[Relayer 中继]
+        I[L1Bridge 完成转账]
+    end
 
-    style A fill:#ffe1e1
-    style B fill:#ffe1e1
-    style C fill:#e1ffe1
-    style D fill:#e1ffe1
-    style E fill:#e1e1ff
-    style F fill:#e1e1ff
-    style G fill:#e1e1ff
-    style H fill:#ffe1ff
+    subgraph "L1 状态变化"
+        J[StakingManager 接收 ETH]
+        K[unallocatedETH<br/>+ stakeAmount]
+        L[DETH.totalSupply<br/>+ dETH数量]
+        M[DETH.balances用户<br/>+ dETH数量]
+    end
+
+    A --> B
+    B --> C
+    C --> D
+    D --> E
+    E --> F
+    F --> G
+    G --> H
+    H --> I
+    I --> J
+    J --> K
+    K --> L
+    L --> M
+
+    style A fill:#e1f5ff
+    style B fill:#e1f5ff
+    style C fill:#e1f5ff
+    style D fill:#ffe1ff
+    style E fill:#e1f5ff
+    style F fill:#fff5e1
+    style G fill:#fff5e1
+    style H fill:#fff5e1
+    style I fill:#fff5e1
+    style J fill:#ffe1e1
+    style K fill:#ffe1e1
+    style L fill:#e1ffe1
+    style M fill:#e1ffe1
 ```
 
 ### 状态变化表
 
 | 阶段 | 合约 | 状态变量 | 变化 |
 |------|------|----------|------|
-| L1 存款 | L1PoolManager | `balance` | +X ETH |
-| L1 质押 | StakingManager | `unallocatedETH` | +X ETH |
-| 铸造 dETH | DETH | `totalSupply` | +dETH数量 |
-| 铸造 dETH | DETH | `balances[user]` | +dETH数量 |
-| 跨链转移 | DETH | `balances[user]` | -dETH数量 |
-| 跨链转移 | DETH | `balances[L2地址]` | +dETH数量 |
-| L2 存入策略 | Strategy | `totalShares` | +份额 |
-| L2 存入策略 | Strategy | `shares[user]` | +份额 |
-| L2 记录份额 | StrategyManager | `stakerStrategyShares[user][strategy]` | +份额 |
+| L2 存款 | Strategy | `totalShares` | +新份额 |
+| L2 存款 | StrategyManager | `stakerStrategyShares[user][strategy]` | +新份额 |
+| L2 存款 | Strategy | ETH 余额 | +用户存款 |
 | L2 委托 | DelegationManager | `delegatedTo[user]` | =operator |
 | L2 委托 | DelegationManager | `operatorShares[operator][strategy]` | +份额 |
+| L2 桥接 | Strategy | ETH 余额 | -转移金额 |
+| L2 桥接 | Strategy | `nextNonce` | +1 |
+| L2 桥接 | L2Bridge | ETH 余额 | +转移金额 |
+| L1 完成 | StakingManager | ETH 余额 | +转移金额 |
+| L1 铸造 | StakingManager | `unallocatedETH` | +stakeAmount |
+| L1 铸造 | DETH | `totalSupply` | +dETH数量 |
+| L1 铸造 | DETH | `balances[staker]` | +dETH数量 |
 
 ---
 
@@ -805,70 +944,33 @@ graph LR
 
 ### 可能的错误和回滚
 
-#### 1. L1 质押阶段错误
+#### 1. L2 存款阶段错误
 
 ```solidity
-// StakingManager.stake()
+// StrategyManager.depositETHIntoStrategy()
 
-// 错误 1: 存款金额过小
-if (msg.value < minimumDepositAmount) {
-    revert DepositTooSmall(msg.value, minimumDepositAmount);
-}
+// 错误 1: 策略存款暂停
+require(getL2Pauser().isStrategyDeposit(), "depositETHIntoStrategy paused");
 
-// 错误 2: dETH 供应量超限
-if (getDETH().totalSupply() + dETHToMint > maximumDETHSupply) {
-    revert MaximumSupplyReached();
-}
+// 错误 2: 策略未加入白名单
+require(
+    strategyIsWhitelistedForDeposit[strategy],
+    "strategy not whitelisted"
+);
 
-// 错误 3: 合约暂停
-if (IL1Pauser(getLocator().pauser()).isStakingPaused()) {
-    revert Paused();
-}
+// 错误 3: 转账失败
+(bool sent, ) = payable(strategy).call{value: msg.value}("");
+require(sent, "send eth to strategy fail");
+
+// 错误 4: 新份额为 0
+require(newShares != 0, "newShares cannot be zero");
 ```
 
 **处理方式**: 交易回滚,用户的 ETH 不会被扣除
 
 ---
 
-#### 2. 跨链桥接错误
-
-```solidity
-// TokenBridgeBase.BridgeInitiateStakingMessage()
-
-// 错误 1: 未授权调用
-require(msg.sender == authorizedCaller, "Unauthorized");
-
-// 错误 2: 消息发送失败
-require(messageManager.sendMessage(...), "Message send failed");
-```
-
-**处理方式**:
-- 消息发送失败会回滚整个交易
-- 用户的 dETH 转账会成功,但跨链消息不会发送
-- ⚠️ 需要 Relayer 重新监听和处理
-
----
-
-#### 3. L2 Strategy 存款错误
-
-```solidity
-// Strategy.deposit()
-
-// 错误 1: 仅 StrategyManager 可调用
-require(msg.sender == strategyManager, "Unauthorized");
-
-// 错误 2: 存款金额为 0
-require(amount > 0, "Deposit amount must be greater than 0");
-
-// 错误 3: 策略暂停
-require(!paused, "Strategy is paused");
-```
-
-**处理方式**: 交易回滚,跨链消息需要重新中继
-
----
-
-#### 4. L2 委托错误
+#### 2. L2 委托错误
 
 ```solidity
 // DelegationManager.delegateTo()
@@ -884,18 +986,71 @@ require(
     _verifyApproverSignature(...),
     "Invalid approver signature"
 );
-
-// 错误 4: 质押者无份额
-require(
-    strategyManager.getStakerStrategyList(msg.sender).length > 0,
-    "Staker has no strategies"
-);
 ```
 
 **处理方式**:
-- 委托失败,但质押份额已经成功存入
+- 委托失败,但存款份额已经成功
 - 用户可以稍后重新尝试委托
 - 或者选择不委托,直接持有份额
+
+---
+
+#### 3. L2 跨链桥接错误
+
+```solidity
+// StrategyBase.transferETHToL2DappLinkBridge()
+
+// 错误 1: 余额不足 32 ETH
+if (address(this).balance <= 32e18) {
+    return false;  // 不回滚,只是不执行
+}
+
+// 错误 2: 桥接调用失败
+bool success = SafeCall.callWithMinGas(...);
+require(success, "transfer failed");
+
+// 错误 3: 仅 Relayer 可调用
+modifier onlyRelayer() {
+    require(msg.sender == relayer, "onlyRelayer");
+    _;
+}
+```
+
+**处理方式**:
+- 桥接失败会回滚整个交易
+- ETH 保留在 Strategy 合约中
+- ⚠️ 需要 Relayer 重新尝试
+
+---
+
+#### 4. L1 质押错误
+
+```solidity
+// StakingManager.stake()
+
+// 错误 1: 质押暂停
+if (getL1Pauser().isStakingPaused()) {
+    revert Paused();
+}
+
+// 错误 2: 存款金额过小
+if (msg.value < minimumDepositAmount || stakeAmount < minimumDepositAmount) {
+    revert MinimumDepositAmountNotSatisfied();
+}
+
+// 错误 3: dETH 供应量超限
+if (dETHMintAmount + getDETH().totalSupply() > maximumDETHSupply) {
+    revert MaximumDETHSupplyExceeded();
+}
+
+// 错误 4: 仅桥接合约可调用
+modifier onlyDappLinkBridge() {
+    require(msg.sender == getLocator().dapplinkBridge(), "only bridge");
+    _;
+}
+```
+
+**处理方式**: 交易回滚,ETH 保留在 Bridge 合约中
 
 ---
 
@@ -903,34 +1058,45 @@ require(
 
 #### 1. 初始质押 (totalSupply = 0)
 
-**情况**: 协议刚启动,还没有任何 dETH
-
+**L2 Strategy 端**:
 ```solidity
-// DETH.ethToDETH()
+// StrategyBase.deposit()
+virtualShareAmount = totalShares + SHARES_OFFSET;  // 0 + 1000 = 1000
+virtualTokenBalance = amount + BALANCE_OFFSET;     // amount + 1000
+virtualPriorBalance = virtualTokenBalance - amount; // 1000
+
+newShares = (amount * 1000) / 1000 = amount;  // 1:1
+```
+
+**L1 DETH 端**:
+```solidity
+// StakingManager.ethToDETH()
 if (totalSupply() == 0) {
     return ethAmount;  // 初始汇率 1:1
 }
 ```
 
-**结果**: 第一个质押者按 1:1 汇率铸造 dETH
+**结果**: 第一个质押者在 L2 和 L1 都按 1:1 汇率获得份额/dETH
 
 ---
 
-#### 2. 大额质押
+#### 2. 策略余额不足 32 ETH
 
-**情况**: 用户质押金额远超 `minimumDepositAmount`
+**情况**: Strategy 合约只有 20 ETH
 
 ```solidity
-// StakingManager.stake()
-// 检查 maximumDETHSupply
-if (getDETH().totalSupply() + dETHToMint > maximumDETHSupply) {
-    revert MaximumSupplyReached();
+// StrategyBase.transferETHToL2DappLinkBridge()
+if (address(this).balance > 32e18) {
+    // 只有当余额 > 32 ETH 才执行
+    // ...
 }
+return false;  // 返回 false,不回滚
 ```
 
 **处理**:
-- 如果超过最大供应量限制,交易回滚
-- 管理员需要提高 `maximumDETHSupply` 或等待其他用户解质押
+- 函数返回 `false`,不触发跨链
+- 等待更多用户存款,累积到 32 ETH 后再桥接
+- 用户的份额已记录,不受影响
 
 ---
 
@@ -939,43 +1105,51 @@ if (getDETH().totalSupply() + dETHToMint > maximumDETHSupply) {
 **情况**: Relayer 宕机或网络拥堵,消息长时间未中继
 
 **影响**:
-- 用户的 dETH 已转移到 L2 地址
-- 但 L2 份额尚未更新
-- 用户在 L2 上看不到份额
+- L2 Strategy 的 ETH 已转入 Bridge
+- 但 L1 尚未收到 ETH,未铸造 dETH
+- 用户在 L2 持有份额,但 L1 没有对应 dETH
 
 **解决方案**:
 - Relayer 恢复后会继续中继消息
 - 消息队列保证消息不会丢失
-- 用户可以查询 L1 事件确认质押成功
+- 用户可以查询 L2 事件确认存款成功
 
 ---
 
-#### 4. 委托给未注册运营商
+#### 4. 大额质押超出 maximumDETHSupply
 
-**情况**: 用户尝试委托给一个未调用 `registerAsOperator()` 的地址
-
-```solidity
-// DelegationManager.delegateTo()
-require(isOperator(operator), "Operator not registered");
-```
-
-**结果**: 交易回滚,用户需要选择已注册的运营商
-
----
-
-#### 5. 重复委托
-
-**情况**: 用户已委托给运营商 A,再次尝试委托给运营商 B
+**情况**: 用户质押金额 + 现有 dETH 供应量 > `maximumDETHSupply`
 
 ```solidity
-// DelegationManager.delegateTo()
-require(!isDelegated(msg.sender), "Already delegated");
+// StakingManager.stake()
+if (dETHMintAmount + getDETH().totalSupply() > maximumDETHSupply) {
+    revert MaximumDETHSupplyExceeded();
+}
 ```
 
 **处理**:
-- 交易回滚
-- 用户需要先调用 `undelegate()` 解除委托
-- 然后才能委托给新运营商
+- 交易回滚,质押失败
+- 管理员需要提高 `maximumDETHSupply`
+- 或者等待其他用户解质押,释放供应量
+
+---
+
+#### 5. 批量铸造中部分地址无效
+
+**情况**: `batchMints` 数组中包含零地址
+
+```solidity
+// DETH._mint() 内部会检查
+function _mint(address account, uint256 amount) internal {
+    require(account != address(0), "ERC20: mint to the zero address");
+    // ...
+}
+```
+
+**处理**:
+- 整个批量铸造交易回滚
+- ⚠️ Relayer 需要确保 `batchMints` 数组中所有地址都有效
+- ⚠️ 建议在调用前进行链下验证
 
 ---
 
@@ -983,29 +1157,47 @@ require(!isDelegated(msg.sender), "Already delegated");
 
 ### 关键要点
 
-1. **双层汇率系统**:
-   - **L1**: dETH/ETH 汇率(反映验证者收益)
-   - **L2**: 份额/资产 汇率(反映策略收益)
+1. **双层份额系统**:
+   - **L2**: Strategy 份额(使用虚拟余额防通胀攻击)
+   - **L1**: dETH 代币(反映验证者收益)
 
-2. **跨链同步**:
-   - dETH 转账自动触发跨链消息
-   - Relayer 负责中继消息到 L2
-   - L2 收到消息后更新份额
+2. **批量处理机制**:
+   - L2 Strategy 累积到 32 ETH 后批量桥接
+   - L1 StakingManager 使用 `batchMint` 一次性铸造多个用户的 dETH
+   - 提高 Gas 效率,确保同批用户获得公平汇率
 
 3. **委托机制**:
    - 用户可以选择委托给运营商
-   - 运营商份额 = 所有委托者份额之和
    - 委托不转移所有权,只是授权运营商管理
+   - 运营商份额 = 所有委托者份额之和
 
 4. **安全检查**:
+   - 虚拟余额防止通胀攻击
    - 最小/最大金额限制
    - 暂停机制
    - 重入保护
    - 权限验证
 
+5. **Relayer 职责**:
+   - 触发 L2 Strategy 的 ETH 桥接
+   - 中继跨链消息到 L1
+   - 调用 L1 StakingManager 批量铸造 dETH
+   - 需要妥善处理失败重试
+
+### 与原文档的主要差异
+
+| 方面 | 原文档(错误) | 正确流程 |
+|------|------------|----------|
+| **起点** | L1 (用户存入 ETH) | L2 (用户存入 ETH 到策略) |
+| **终点** | L2 (获得策略份额) | L1 (铸造 dETH) |
+| **流向** | L1 → L2 | L2 → L1 |
+| **L1 角色** | 存款入口 | 铸造 dETH 凭证 |
+| **L2 角色** | 份额接收者 | 存款入口和份额管理 |
+| **dETH 位置** | L1 铸造后桥接到 L2 | L1 铸造并保留在 L1 |
+| **触发时机** | 用户主动触发 | Relayer 定时触发(累积到 32 ETH) |
+
 ### 相关文档
 
 - [系统架构图](./architecture.md)
-- [奖励分发流程](./2-rewards-flow.md)
 - [解质押流程](./3-unstaking-flow.md)
-- [取款完成流程](./4-withdrawal-flow.md)
+- [奖励分发流程](./2-rewards-flow.md)
