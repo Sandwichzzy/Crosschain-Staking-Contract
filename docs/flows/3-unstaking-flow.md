@@ -2173,6 +2173,5 @@ T6: 用户在 L2 完成提款队列
 - [系统架构图](./architecture.md)
 - [质押流程详解](./1-staking-flow.md)
 - [奖励分发详解](./2-rewards-flow.md)
-- [修正说明](./3-unstaking-flow-corrections.md)
 
 ---

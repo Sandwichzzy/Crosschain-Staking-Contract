@@ -666,5 +666,4 @@ struct Config {
 **相关文档**:
 - [质押流程详解](./1-staking-flow.md)
 - [奖励分发详解](./2-rewards-flow.md)
-- [解质押流程详解](./3-unstaking-flow.md)
-- [取款完成详解](./4-withdrawal-flow.md)
+- [解质押流程详解](./3-unstaking-flow.md) (包含完整的解质押和取款流程)
