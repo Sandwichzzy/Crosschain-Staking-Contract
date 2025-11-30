@@ -8,13 +8,13 @@ pragma solidity ^0.8.24;
 /// @dev "window" 数量是指在 `updateStartBlock` 和 `updateEndBlock` 之间的区块窗口内的累计值。
 /// @param updateStartBlock 预言机记录区块窗口的起始块。这应该比前一个预言机记录的 updateEndBlock 高 1。
 /// @param updateEndBlock 计算此预言机记录所基于的区块号（包含该区块）。
-/// @param currentNumValidatorsNotWithdrawable 没有可提款状态的验证者数量。
-/// @param cumulativeNumValidatorsWithdrawable 具有可提款状态的验证者总数。
+/// @param currentNumValidatorsNotWithdrawable  当前不可提款验证者数量
+/// @param cumulativeNumValidatorsWithdrawable 累计可提款验证者数量。
 /// 这些验证者的状态为 `withdrawal_possible` 或 `withdrawal_done`。注意：由于充值，验证者可能在这两种状态之间波动。
-/// @param windowWithdrawnPrincipalAmount 在分析的区块窗口内从共识层提取的本金数量。
-/// @param windowWithdrawnRewardAmount 在分析的区块窗口内从共识层提取的奖励数量。
-/// @param currentTotalValidatorBalance 共识层中的 ETH 总量（即所有验证者余额之和）。这是计算协议控制的总价值的主要数量之一。
-/// @param cumulativeProcessedDepositAmount 已存入共识层并被处理的 ETH 总量。这用于防止重复计算存入共识层的 ETH。
+/// @param windowWithdrawnPrincipalAmount 窗口内提取的本金
+/// @param windowWithdrawnRewardAmount  窗口内提取的奖励
+/// @param currentTotalValidatorBalance 当前验证者总余额。这是计算协议控制的总价值的主要数量之一。
+/// @param cumulativeProcessedDepositAmount 累计已处理的存款金额, 这用于防止重复计算存入共识层的 ETH。
 struct OracleRecord {
     uint64 updateStartBlock;
     uint64 updateEndBlock;

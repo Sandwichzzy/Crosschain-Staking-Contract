@@ -90,19 +90,30 @@ sequenceDiagram
     opt 用户选择委托
         User->>DelegationMgr: delegateTo(operator, approverSignature)
         activate DelegationMgr
-        DelegationMgr->>DelegationMgr: 检查 operator 是否已注册
+        DelegationMgr->>DelegationMgr: 检查暂停状态 isDelegate()
         DelegationMgr->>DelegationMgr: 检查 user 未委托给其他人
-        DelegationMgr->>DelegationMgr: delegatedTo[user] = operator
+        DelegationMgr->>DelegationMgr: 检查 operator 是否已注册
 
-        loop 遍历用户的所有策略
-            DelegationMgr->>StrategyMgr: getStakerStrategyShares(user, strategy)
-            activate StrategyMgr
-            StrategyMgr-->>DelegationMgr: return 份额
-            deactivate StrategyMgr
-            DelegationMgr->>DelegationMgr: operatorShares[operator][strategy] += 份额
+        alt operator 设置了 delegationApprover
+            DelegationMgr->>DelegationMgr: 验证签名和 approverSalt
+            DelegationMgr->>DelegationMgr: 标记 approverSalt 已使用
         end
 
+        DelegationMgr->>DelegationMgr: delegatedTo[user] = operator
         DelegationMgr-->>User: emit StakerDelegated(user, operator)
+
+        DelegationMgr->>DelegationMgr: getDelegatableShares(user)
+        DelegationMgr->>StrategyMgr: getDeposits(user)
+        activate StrategyMgr
+        StrategyMgr-->>DelegationMgr: return (strategies[], shares[])
+        deactivate StrategyMgr
+
+        loop 遍历用户的所有策略
+            DelegationMgr->>DelegationMgr: operatorShares[operator][strategy] += shares
+            DelegationMgr->>DelegationMgr: stakerStrategyOperatorShares[operator][strategy][user] += shares
+            DelegationMgr-->>User: emit OperatorSharesIncreased(...)
+        end
+
         deactivate DelegationMgr
     end
 
@@ -125,14 +136,21 @@ sequenceDiagram
 
     Note over Relayer: Relayer 监听事件并中继到 L1
 
-    Relayer->>L1Bridge: BridgeFinalizeETH(sourceChainId, destChainId, to, amount, messageHash, proof)
+    Relayer->>L1Bridge: BridgeFinalizeETH(sourceChainId, destChainId, to, amount, _fee, _nonce)
     activate L1Bridge
-    L1Bridge->>L1Bridge: 验证消息哈希和证明
+    L1Bridge->>L1Bridge: 验证链 ID
     L1Bridge->>StakingMgr: call{value: amount}("")
     activate StakingMgr
     StakingMgr->>StakingMgr: 接收 ETH
     deactivate StakingMgr
-    L1Bridge-->>Relayer: emit BridgeFinalized(...)
+    L1Bridge->>L1Bridge: FundingPoolBalance[ETH] -= amount
+    L1Bridge->>MessageManager: claimMessage(sourceChainId, destChainId, to, _fee, amount, _nonce)
+    activate MessageManager
+    MessageManager->>MessageManager: 生成 messageHash
+    MessageManager->>MessageManager: claimMessageStatus[messageHash] = true
+    MessageManager-->>L1Bridge: emit MessageClaimed(...)
+    deactivate MessageManager
+    L1Bridge-->>Relayer: emit FinalizeETH(...)
     deactivate L1Bridge
 
     Note over Relayer,DETH: 阶段 4: L1 批量质押和铸造 dETH
@@ -332,7 +350,7 @@ function _addShares(address staker, IERC20 weth, address strategy, uint256 share
 
 **合约**: `DelegationManager.sol`
 **函数**: `delegateTo(address operator, SignatureWithExpiry memory approverSignatureAndExpiry, bytes32 approverSalt)`
-**文件位置**: `src/L2/core/DelegationManager.sol:69-73`
+**文件位置**: `src/L2/core/DelegationManager.sol:69-73, 241-288, 351-355`
 
 ```solidity
 function delegateTo(
@@ -349,48 +367,85 @@ function _delegate(
     SignatureWithExpiry memory approverSignatureAndExpiry,
     bytes32 approverSalt
 ) internal {
-    // 1. 检查运营商是否已注册
-    require(isOperator(operator), "Operator not registered");
+    // 0. 检查暂停状态
+    require(getL2Pauser().isDelegate(), "DelegationManager:isDelegate paused");
 
-    // 2. 检查质押者未委托给其他人
-    require(!isDelegated(staker), "Already delegated");
+    // 1. 检查质押者未委托给其他人
+    require(!isDelegated(staker), "DelegationManager._delegate: staker is already actively delegated");
 
-    // 3. 验证运营商签名(如果需要批准)
-    if (_operatorDetails[operator].delegationApprover != address(0)) {
-        _verifyApproverSignature(
-            staker,
-            operator,
-            approverSignatureAndExpiry,
-            approverSalt
+    // 2. 检查运营商是否已注册
+    require(isOperator(operator), "DelegationManager._delegate: operator is not registered in DappLink");
+
+    // 3. 验证授权者签名(如果运营商设置了 delegationApprover)
+    address _delegationApprover = _operatorDetails[operator].delegationApprover;
+    if (_delegationApprover != address(0) && msg.sender != _delegationApprover && msg.sender != operator) {
+        // 检查签名是否过期
+        require(
+            approverSignatureAndExpiry.expiry >= block.timestamp,
+            "DelegationManager._delegate: approver signature expired"
+        );
+
+        // 检查 salt 是否已使用
+        require(
+            !delegationApproverSaltIsSpent[_delegationApprover][approverSalt],
+            "DelegationManager._delegate: approverSalt already spent"
+        );
+        delegationApproverSaltIsSpent[_delegationApprover][approverSalt] = true;
+
+        // 计算签名哈希
+        bytes32 approverDigestHash = calculateDelegationApprovalDigestHash(
+            staker, operator, _delegationApprover, approverSalt, approverSignatureAndExpiry.expiry
+        );
+
+        // 验证 EIP-1271 签名
+        EIP1271SignatureUtils.checkSignature_EIP1271(
+            staker, approverDigestHash, approverSignatureAndExpiry.signature
         );
     }
 
     // 4. 设置委托关系
     delegatedTo[staker] = operator;
 
-    // 5. 增加运营商的份额
-    _increaseDelegatedShares(staker, operator);
-
-    // 6. 触发事件
+    // 5. 触发委托事件
     emit StakerDelegated(staker, operator);
+
+    // 6. 获取质押者在所有策略中的份额
+    (address[] memory strategies, uint256[] memory shares) = getDelegatableShares(staker);
+
+    // 7. 遍历所有策略,增加运营商的份额
+    for (uint256 i = 0; i < strategies.length;) {
+        _increaseOperatorShares({
+            operator: operator,
+            staker: staker,
+            strategy: strategies[i],
+            shares: shares[i]
+        });
+        unchecked {
+            ++i;
+        }
+    }
 }
 
-function _increaseDelegatedShares(
+function _increaseOperatorShares(
+    address operator,
     address staker,
-    address operator
+    address strategy,
+    uint256 shares
 ) internal {
-    // 获取质押者的所有策略
-    address[] memory strategies = strategyManager.getStakerStrategyList(staker);
+    // 增加运营商在该策略的总份额
+    operatorShares[operator][strategy] += shares;
 
-    // 遍历增加运营商份额
-    for (uint256 i = 0; i < strategies.length; i++) {
-        address strategy = strategies[i];
-        uint256 shares = strategyManager.getStakerStrategyShares(staker, strategy);
+    // ⭐ 记录该运营商从特定质押者获得的份额(用于精确追踪)
+    stakerStrategyOperatorShares[operator][strategy][staker] += shares;
 
-        operatorShares[operator][strategy] += shares;
+    emit OperatorSharesIncreased(operator, staker, strategy, shares);
+}
 
-        emit OperatorSharesIncreased(operator, staker, strategy, shares);
-    }
+// 辅助函数: 获取质押者可委托的份额
+function getDelegatableShares(address staker) public view returns (address[] memory, uint256[] memory) {
+    (address[] memory strategyManagerStrats, uint256[] memory strategyManagerShares) =
+        getStrategyManager().getDeposits(staker);
+    return (strategyManagerStrats, strategyManagerShares);
 }
 ```
 
@@ -398,11 +453,18 @@ function _increaseDelegatedShares(
 - `delegatedTo[staker]` 设置为 `operator`
 - 对于质押者的每个策略:
   - `operatorShares[operator][strategy]` 增加相应份额
+  - ⭐ `stakerStrategyOperatorShares[operator][strategy][staker]` 增加相应份额(新增)
+- 如果使用了 `delegationApprover`:
+  - `delegationApproverSaltIsSpent[_delegationApprover][approverSalt]` 设置为 `true`
 
 **前置条件**:
-- ✅ 运营商已调用 `registerAsOperator()` 注册
-- ✅ 质押者未委托给其他运营商
-- ✅ 如果运营商设置了 `delegationApprover`,需要提供有效签名
+- ✅ 合约未暂停委托功能 (`getL2Pauser().isDelegate()`)
+- ✅ 质押者未委托给其他运营商 (`!isDelegated(staker)`)
+- ✅ 运营商已调用 `registerAsOperator()` 注册 (`isOperator(operator)`)
+- ✅ 如果运营商设置了 `delegationApprover` 且调用者不是 approver 或 operator:
+  - 需要提供有效的 EIP-1271 签名
+  - 签名未过期 (`approverSignatureAndExpiry.expiry >= block.timestamp`)
+  - `approverSalt` 未被使用过
 
 ---
 
@@ -476,7 +538,7 @@ function transferETHToL2DappLinkBridge(
 
 **合约**: `TokenBridgeBase.sol` (L2 实例)
 **函数**: `BridgeInitiateETH(uint256 sourceChainId, uint256 destChainId, address to)`
-**文件位置**: `src/bridge/core/bridge/TokenBridgeBase.sol:194-216`
+**文件位置**: `src/bridge/core/bridge/TokenBridgeBase.sol:149-173`
 
 ```solidity
 function BridgeInitiateETH(
@@ -484,38 +546,100 @@ function BridgeInitiateETH(
     uint256 destChainId,
     address to
 ) external payable returns (bool) {
-    require(msg.value > 0, "TokenBridge.BridgeInitiateETH: Cannot send 0 value");
+    // 1. 验证源链 ID 与当前链 ID 一致
+    if (sourceChainId != block.chainid) {
+        revert sourceChainIdError();
+    }
 
-    // 生成消息哈希
-    bytes32 messageHash = keccak256(
-        abi.encode(
-            sourceChainId,
-            destChainId,
-            to,
-            msg.value,
-            messageNumber
-        )
-    );
+    // 2. 验证目标链 ID 在支持列表中
+    if (!IsSupportChainId(destChainId)) {
+        revert ChainIdIsNotSupported(destChainId);
+    }
 
-    // 触发事件供 Relayer 监听
-    emit InitiateETH(
-        sourceChainId,
-        destChainId,
-        to,
-        msg.value,
-        messageNumber,
-        messageHash
-    );
+    // 3. 检查转账金额是否达到最小限额
+    if (msg.value < MinTransferAmount) {
+        revert LessThanMinTransferAmount(MinTransferAmount, msg.value);
+    }
 
-    messageNumber++;
+    // 4. 增加资金池余额
+    FundingPoolBalance[ContractsAddress.ETHAddress] += msg.value;
+
+    // 5. ⭐ 计算手续费(默认 1% = 10000/1000000)
+    uint256 fee = (msg.value * PerFee) / 1_000_000;
+    uint256 amount = msg.value - fee;
+
+    // 6. 将手续费记录到费用池
+    FeePoolValue[ContractsAddress.ETHAddress] += fee;
+
+    // 7. ⭐ 调用 MessageManager 发送跨链消息
+    messageManager.sendMessage(block.chainid, destChainId, to, amount, fee);
+
+    // 8. 触发事件供 Relayer 监听
+    emit InitiateETH(sourceChainId, destChainId, msg.sender, to, amount);
+
     return true;
 }
 ```
 
+**关键差异**:
+- ⭐ **手续费机制**: 从转账金额中扣除 1% 手续费 (`PerFee = 10000`)
+- ⭐ **MessageManager 集成**: 通过 `messageManager.sendMessage()` 发送跨链消息,而不是直接生成哈希
+- ⭐ **资金池管理**: 维护 `FundingPoolBalance` 和 `FeePoolValue` 两个独立的池
+- ⭐ **事件参数**: `emit InitiateETH` 包含 `msg.sender` (from) 和扣除手续费后的 `amount`
+
 **状态变化**:
-- Bridge 合约接收 ETH
-- 生成跨链消息哈希
-- `messageNumber` 递增
+- Bridge 合约接收 ETH (`msg.value`)
+- `FundingPoolBalance[ETHAddress]` 增加 `msg.value`
+- `FeePoolValue[ETHAddress]` 增加 `fee`
+- MessageManager 状态变化:
+  - `nextMessageNumber` 递增
+  - `sentMessageStatus[messageHash]` 设置为 `true`
+  - 触发 `MessageSent` 事件供 Relayer 监听
+
+**MessageManager.sendMessage() 详解**:
+```solidity
+// src/bridge/core/message/MessageManager.sol:58-91
+function sendMessage(
+    uint256 sourceChainId,
+    uint256 destChainId,
+    address _to,
+    uint256 _value,
+    uint256 _fee
+) external onlyTokenBridge {
+    uint256 messageNumber = nextMessageNumber;
+
+    // 生成消息哈希(注意参数顺序: sourceChainId, destChainId, _to, _fee, _value, messageNumber)
+    bytes32 messageHash = keccak256(
+        abi.encode(
+            sourceChainId,
+            destChainId,
+            _to,
+            _fee,
+            _value,
+            messageNumber
+        )
+    );
+
+    nextMessageNumber++;
+    sentMessageStatus[messageHash] = true;
+
+    emit MessageSent(
+        sourceChainId,
+        destChainId,
+        msg.sender,
+        _to,
+        _fee,
+        _value,
+        messageNumber,
+        messageHash
+    );
+}
+```
+
+**前置条件**:
+- ✅ `sourceChainId` 必须等于 `block.chainid`
+- ✅ `destChainId` 必须在 `IsSupportedChainId` 映射中为 `true`
+- ✅ `msg.value` 必须 >= `MinTransferAmount` (默认 0.1 ETH)
 
 ---
 
@@ -556,7 +680,7 @@ await l1Bridge.BridgeFinalizeETH(
 
 **合约**: `TokenBridgeBase.sol` (L1 实例)
 **函数**: `BridgeFinalizeETH(...)`
-**文件位置**: `src/bridge/core/bridge/TokenBridgeBase.sol:218-244`
+**文件位置**: `src/bridge/core/bridge/TokenBridgeBase.sol:302-333`
 
 ```solidity
 function BridgeFinalizeETH(
@@ -564,35 +688,87 @@ function BridgeFinalizeETH(
     uint256 destChainId,
     address to,
     uint256 amount,
-    bytes32 messageHash,
-    bytes memory proof
-) external returns (bool) {
-    // 验证消息哈希
-    bytes32 computedHash = keccak256(
-        abi.encode(sourceChainId, destChainId, to, amount, messageNumber)
-    );
-    require(computedHash == messageHash, "Invalid message hash");
+    uint256 _fee,
+    uint256 _nonce
+) external payable onlyRole(ReLayer) returns (bool) {
+    // 1. 验证目标链 ID 与当前链 ID 一致
+    if (destChainId != block.chainid) {
+        revert sourceChainIdError();
+    }
 
-    // 转移 ETH 到目标地址
-    (bool success, ) = to.call{value: amount}("");
-    require(success, "TokenBridge.BridgeFinalizeETH: transfer failed");
+    // 2. 验证源链 ID 在支持列表中
+    if (!IsSupportChainId(sourceChainId)) {
+        revert ChainIdIsNotSupported(sourceChainId);
+    }
 
-    emit FinalizeETH(
+    // 3. ⭐ 转移 ETH 到目标地址 (StakingManager)
+    (bool _ret, ) = payable(to).call{value: amount}("");
+    if (!_ret) {
+        revert TransferETHFailed();
+    }
+
+    // 4. 减少资金池余额
+    FundingPoolBalance[ContractsAddress.ETHAddress] -= amount;
+
+    // 5. ⭐ 调用 MessageManager 标记消息已认领
+    messageManager.claimMessage(
         sourceChainId,
         destChainId,
         to,
+        _fee,
         amount,
-        messageNumber,
-        messageHash
+        _nonce
     );
+
+    // 6. 触发完成事件
+    emit FinalizeETH(sourceChainId, destChainId, address(this), to, amount);
 
     return true;
 }
 ```
 
+**MessageManager.claimMessage() 详解**:
+```solidity
+// src/bridge/core/message/MessageManager.sol:102-115
+function claimMessage(
+    uint256 sourceChainId,
+    uint256 destChainId,
+    address _to,
+    uint256 _fee,
+    uint256 _value,
+    uint256 _nonce
+) external onlyTokenBridge nonReentrant {
+    // 生成与源链相同的消息哈希
+    bytes32 messageHash = keccak256(
+        abi.encode(sourceChainId, destChainId, _to, _fee, _value, _nonce)
+    );
+
+    // 标记消息已认领,防止重放攻击
+    claimMessageStatus[messageHash] = true;
+
+    emit MessageClaimed(sourceChainId, destChainId, messageHash);
+}
+```
+
+**关键特性**:
+- ⭐ **权限控制**: 仅限 Relayer 角色调用 (`onlyRole(ReLayer)`)
+- ⭐ **资金池管理**: 从 `FundingPoolBalance` 扣除,确保流动性平衡
+- ⭐ **消息验证**: 通过 MessageManager 防止重放攻击
+- ⭐ **重入保护**: MessageManager 的 `claimMessage` 使用 `nonReentrant` 修饰符
+
 **状态变化**:
-- ETH 从 Bridge 转入 StakingManager
-- 触发 `FinalizeETH` 事件
+- ETH 从 L1 Bridge 转入 StakingManager (`amount`)
+- `FundingPoolBalance[ETHAddress]` 减少 `amount`
+- MessageManager 状态变化:
+  - `claimMessageStatus[messageHash]` 设置为 `true`
+  - 触发 `MessageClaimed` 事件
+
+**前置条件**:
+- ✅ 调用者必须具有 `ReLayer` 角色
+- ✅ `destChainId` 必须等于 `block.chainid`
+- ✅ `sourceChainId` 必须在 `IsSupportedChainId` 映射中为 `true`
+- ✅ Bridge 合约必须有足够的 ETH 余额
+- ✅ 消息哈希未被认领过 (在 MessageManager 中检查)
 
 ---
 
@@ -930,9 +1106,16 @@ graph LR
 | L2 存款 | Strategy | ETH 余额 | +用户存款 |
 | L2 委托 | DelegationManager | `delegatedTo[user]` | =operator |
 | L2 委托 | DelegationManager | `operatorShares[operator][strategy]` | +份额 |
+| L2 委托 | DelegationManager | `stakerStrategyOperatorShares[operator][strategy][user]` | +份额 |
 | L2 桥接 | Strategy | ETH 余额 | -转移金额 |
 | L2 桥接 | Strategy | `nextNonce` | +1 |
 | L2 桥接 | L2Bridge | ETH 余额 | +转移金额 |
+| L2 桥接 | L2Bridge | `FundingPoolBalance[ETH]` | +转移金额 |
+| L2 桥接 | L2Bridge | `FeePoolValue[ETH]` | +手续费 |
+| L2 桥接 | MessageManager | `nextMessageNumber` | +1 |
+| L2 桥接 | MessageManager | `sentMessageStatus[messageHash]` | =true |
+| L1 完成 | L1Bridge | `FundingPoolBalance[ETH]` | -转移金额 |
+| L1 完成 | MessageManager | `claimMessageStatus[messageHash]` | =true |
 | L1 完成 | StakingManager | ETH 余额 | +转移金额 |
 | L1 铸造 | StakingManager | `unallocatedETH` | +stakeAmount |
 | L1 铸造 | DETH | `totalSupply` | +dETH数量 |
@@ -1175,12 +1358,21 @@ function _mint(address account, uint256 amount) internal {
    - 虚拟余额防止通胀攻击
    - 最小/最大金额限制
    - 暂停机制
-   - 重入保护
-   - 权限验证
+   - 重入保护 (MessageManager 的 `claimMessage`)
+   - 权限验证 (Relayer 角色)
+   - 消息重放保护 (MessageManager 的哈希验证)
 
-5. **Relayer 职责**:
+5. **跨链消息机制**:
+   - 使用 MessageManager 管理跨链消息
+   - 通过 nonce (messageNumber) 保证消息唯一性
+   - `sentMessageStatus` 和 `claimMessageStatus` 双重记录防止重放
+   - 手续费机制: 默认 1% (`PerFee = 10000`)
+   - 资金池分离: `FundingPoolBalance` 和 `FeePoolValue`
+
+6. **Relayer 职责**:
    - 触发 L2 Strategy 的 ETH 桥接
-   - 中继跨链消息到 L1
+   - 监听 MessageManager 的 `MessageSent` 事件
+   - 在 L1 调用 `BridgeFinalizeETH` 完成跨链
    - 调用 L1 StakingManager 批量铸造 dETH
    - 需要妥善处理失败重试
 

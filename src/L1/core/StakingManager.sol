@@ -150,7 +150,7 @@ contract StakingManager is L1Base, IStakingManager {
         }
 
         unallocatedETH += stakeAmount;
-
+        //批量铸造 dETH 给多个接收者
         getDETH().batchMint(batchMints);
 
         emit Staked(getLocator().dapplinkBridge(), stakeAmount, dETHMintAmount);
@@ -319,8 +319,9 @@ contract StakingManager is L1Base, IStakingManager {
     /// 汇率由 dETH 的总供应量和协议控制的总 ETH 给出。
     function ethToDETH(uint256 ethAmount) public returns (uint256) {
         if (getDETH().totalSupply() == 0) {
-            return ethAmount;
+            return ethAmount; // 初始汇率 1:1
         }
+        // dETH 数量 = ethAmount * totalSupply / totalControlled
         return Math.mulDiv(
             ethAmount,
             getDETH().totalSupply() * uint256(_BASIS_POINTS_DENOMINATOR - exchangeAdjustmentRate),

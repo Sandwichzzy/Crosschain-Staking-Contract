@@ -107,9 +107,11 @@ contract MessageManager is
         uint256 _value,
         uint256 _nonce
     ) external onlyTokenBridge nonReentrant {
+        // 生成与源链相同的消息哈希
         bytes32 messageHash = keccak256(
             abi.encode(sourceChainId, destChainId, _to, _fee, _value, _nonce)
         );
+        // 标记消息已认领,防止重放攻击
         claimMessageStatus[messageHash] = true;
         emit MessageClaimed(sourceChainId, destChainId, messageHash);
     }

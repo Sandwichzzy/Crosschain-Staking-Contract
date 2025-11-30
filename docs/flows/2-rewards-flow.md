@@ -242,6 +242,11 @@ struct OracleRecord {
 
 ```solidity
 function receiveRecord(OracleRecord calldata newRecord, ...) external {
+    // 0. 暂停检查
+    if (IL1Pauser(getLocator().pauser()).isSubmitOracleRecordsPaused()) {
+        revert Paused();
+    }
+
     // 1. 权限检查
     if (msg.sender != oracleUpdater) {
         revert UnauthorizedOracleUpdater(msg.sender, oracleUpdater);
@@ -268,7 +273,13 @@ function receiveRecord(OracleRecord calldata newRecord, ...) external {
         // 合理性检查失败,标记为待处理
         _pendingUpdate = newRecord;
         hasPendingUpdate = true;
-        emit OracleRecordFailedSanityCheck(...);
+        emit OracleRecordFailedSanityCheck({
+            reasonHash: keccak256(bytes(rejectionReason)),
+            reason: rejectionReason,
+            record: newRecord,
+            value: value,
+            bound: bound
+        });
         IL1Pauser(getLocator().pauser()).pauseAll();  // 触发全局暂停
         return;
     }
@@ -286,23 +297,30 @@ function validateUpdate(uint256 prevRecordIndex, OracleRecord calldata newRecord
 
     // 检查 1: 区块范围有效
     if (newRecord.updateEndBlock <= newRecord.updateStartBlock) {
-        revert InvalidUpdateEndBeforeStartBlock(...);
+        revert InvalidUpdateEndBeforeStartBlock(newRecord.updateEndBlock, newRecord.updateStartBlock);
     }
 
     // 检查 2: 区块连续性
     if (newRecord.updateStartBlock != prevRecord.updateEndBlock + 1) {
-        revert InvalidUpdateStartBlock(...);
+        revert InvalidUpdateStartBlock(prevRecord.updateEndBlock + 1, newRecord.updateStartBlock);
     }
 
     // 检查 3: 存款金额不能超过协议已存入
     if (newRecord.cumulativeProcessedDepositAmount > getStakingManager().totalDepositedInValidators()) {
-        revert InvalidUpdateMoreDepositsProcessedThanSent(...);
+        revert InvalidUpdateMoreDepositsProcessedThanSent(
+            newRecord.cumulativeProcessedDepositAmount, getStakingManager().totalDepositedInValidators()
+        );
     }
 
     // 检查 4: 验证者数量不能超过已启动数量
-    uint256 totalValidators = newRecord.currentNumValidatorsNotWithdrawable + newRecord.cumulativeNumValidatorsWithdrawable;
-    if (totalValidators > getStakingManager().numInitiatedValidators()) {
-        revert InvalidUpdateMoreValidatorsThanInitiated(...);
+    if (
+        uint256(newRecord.currentNumValidatorsNotWithdrawable)
+        + uint256(newRecord.cumulativeNumValidatorsWithdrawable) > getStakingManager().numInitiatedValidators()
+    ) {
+        revert InvalidUpdateMoreValidatorsThanInitiated(
+            newRecord.currentNumValidatorsNotWithdrawable + newRecord.cumulativeNumValidatorsWithdrawable,
+            getStakingManager().numInitiatedValidators()
+        );
     }
 }
 ```
@@ -316,57 +334,93 @@ function sanityCheckUpdate(
 ) public view returns (string memory, uint256, uint256) {
     uint64 reportSize = newRecord.updateEndBlock - newRecord.updateStartBlock + 1;
 
-    // 检查 1: 报告区块数 ≥ 最小值
-    if (reportSize < minReportSizeBlocks) {
-        return ("Report blocks below minimum bound", reportSize, minReportSizeBlocks);
+    {   // 检查 1: 报告区块数 ≥ 最小值
+        if (reportSize < minReportSizeBlocks) {
+            return ("Report blocks below minimum bound", reportSize, minReportSizeBlocks);
+        }
     }
 
-    // 检查 2: 可提款验证者数量只增不减
-    if (newRecord.cumulativeNumValidatorsWithdrawable < prevRecord.cumulativeNumValidatorsWithdrawable) {
-        return ("Cumulative number of withdrawable validators decreased", ...);
+    {   // 检查 2: 可提款验证者数量只增不减
+        if (newRecord.cumulativeNumValidatorsWithdrawable < prevRecord.cumulativeNumValidatorsWithdrawable) {
+            return (
+                "Cumulative number of withdrawable validators decreased",
+                newRecord.cumulativeNumValidatorsWithdrawable,
+                prevRecord.cumulativeNumValidatorsWithdrawable
+            );
+        }
+
+        // 检查 3: 总验证者数量只增不减
+        {
+            uint256 prevNumValidators =
+                prevRecord.currentNumValidatorsNotWithdrawable + prevRecord.cumulativeNumValidatorsWithdrawable;
+            uint256 newNumValidators =
+                newRecord.currentNumValidatorsNotWithdrawable + newRecord.cumulativeNumValidatorsWithdrawable;
+
+            if (newNumValidators < prevNumValidators) {
+                return ("Total number of validators decreased", newNumValidators, prevNumValidators);
+            }
+        }
     }
 
-    // 检查 3: 总验证者数量只增不减
-    uint256 prevNumValidators = prevRecord.currentNumValidatorsNotWithdrawable + prevRecord.cumulativeNumValidatorsWithdrawable;
-    uint256 newNumValidators = newRecord.currentNumValidatorsNotWithdrawable + newRecord.cumulativeNumValidatorsWithdrawable;
-    if (newNumValidators < prevNumValidators) {
-        return ("Total number of validators decreased", ...);
+    {
+        // 检查 4: 已处理存款金额只增不减
+        if (newRecord.cumulativeProcessedDepositAmount < prevRecord.cumulativeProcessedDepositAmount) {
+            return (
+                "Processed deposit amount decreased",
+                newRecord.cumulativeProcessedDepositAmount,
+                prevRecord.cumulativeProcessedDepositAmount
+            );
+        }
+
+        // 检查 5: 每个新验证者的存款金额在合理范围 [minDepositPerValidator, maxDepositPerValidator]
+        uint256 newDeposits =
+            (newRecord.cumulativeProcessedDepositAmount - prevRecord.cumulativeProcessedDepositAmount);
+        uint256 newValidators = (
+            newRecord.currentNumValidatorsNotWithdrawable + newRecord.cumulativeNumValidatorsWithdrawable
+            - prevRecord.currentNumValidatorsNotWithdrawable - prevRecord.cumulativeNumValidatorsWithdrawable
+        );
+
+        if (newDeposits < newValidators * minDepositPerValidator) {
+            return (
+                "New deposits below min deposit per validator", newDeposits, newValidators * minDepositPerValidator
+            );
+        }
+
+        if (newDeposits > newValidators * maxDepositPerValidator) {
+            return (
+                "New deposits above max deposit per validator", newDeposits, newValidators * maxDepositPerValidator
+            );
+        }
     }
 
-    // 检查 4: 已处理存款金额只增不减
-    if (newRecord.cumulativeProcessedDepositAmount < prevRecord.cumulativeProcessedDepositAmount) {
-        return ("Processed deposit amount decreased", ...);
-    }
+    {
+        // 检查 6: 共识层余额变化在合理范围
+        uint256 baselineGrossCLBalance = prevRecord.currentTotalValidatorBalance
+            + (newRecord.cumulativeProcessedDepositAmount - prevRecord.cumulativeProcessedDepositAmount);
 
-    // 检查 5: 每个新验证者的存款金额在合理范围 [minDepositPerValidator, maxDepositPerValidator]
-    uint256 newDeposits = newRecord.cumulativeProcessedDepositAmount - prevRecord.cumulativeProcessedDepositAmount;
-    uint256 newValidators = newNumValidators - prevNumValidators;
+        uint256 newGrossCLBalance = newRecord.currentTotalValidatorBalance
+            + newRecord.windowWithdrawnPrincipalAmount + newRecord.windowWithdrawnRewardAmount;
 
-    if (newDeposits < newValidators * minDepositPerValidator) {
-        return ("New deposits below min deposit per validator", ...);
-    }
-    if (newDeposits > newValidators * maxDepositPerValidator) {
-        return ("New deposits above max deposit per validator", ...);
-    }
+        {
+            // 下限 = 基线 - 最大损失 + 最小增益
+            uint256 lowerBound = baselineGrossCLBalance
+                - Math.mulDiv(maxConsensusLayerLossPPM, baselineGrossCLBalance, _PPM_DENOMINATOR)
+                + Math.mulDiv(minConsensusLayerGainPerBlockPPT * reportSize, baselineGrossCLBalance, _PPT_DENOMINATOR);
 
-    // 检查 6: 共识层余额变化在合理范围
-    uint256 baselineGrossCLBalance = prevRecord.currentTotalValidatorBalance + newDeposits;
-    uint256 newGrossCLBalance = newRecord.currentTotalValidatorBalance + newRecord.windowWithdrawnPrincipalAmount + newRecord.windowWithdrawnRewardAmount;
+            if (newGrossCLBalance < lowerBound) {
+                return ("Consensus layer change below min gain or max loss", newGrossCLBalance, lowerBound);
+            }
+        }
 
-    // 下限 = 基线 - 最大损失 + 最小增益
-    uint256 lowerBound = baselineGrossCLBalance
-        - Math.mulDiv(maxConsensusLayerLossPPM, baselineGrossCLBalance, _PPM_DENOMINATOR)
-        + Math.mulDiv(minConsensusLayerGainPerBlockPPT * reportSize, baselineGrossCLBalance, _PPT_DENOMINATOR);
+        {
+            // 上限 = 基线 + 最大增益
+            uint256 upperBound = baselineGrossCLBalance
+                + Math.mulDiv(maxConsensusLayerGainPerBlockPPT * reportSize, baselineGrossCLBalance, _PPT_DENOMINATOR);
 
-    if (newGrossCLBalance < lowerBound) {
-        return ("Consensus layer change below min gain or max loss", ...);
-    }
-
-    // 上限 = 基线 + 最大增益
-    uint256 upperBound = baselineGrossCLBalance + Math.mulDiv(maxConsensusLayerGainPerBlockPPT * reportSize, baselineGrossCLBalance, _PPT_DENOMINATOR);
-
-    if (newGrossCLBalance > upperBound) {
-        return ("Consensus layer change above max gain", ...);
+            if (newGrossCLBalance > upperBound) {
+                return ("Consensus layer change above max gain", newGrossCLBalance, upperBound);
+            }
+        }
     }
 
     return ("", 0, 0);  // 通过所有检查
@@ -1386,23 +1440,28 @@ return (L1RewardBalance * userShares) / totalShares;
 // OracleManager.sol:103
 function initRecord() external onlyRole(ORACLE_PENDING_UPDATE_RESOLVER_ROLE) {
     _pushRecord(
-        OracleRecord(
-            0,  // currentTotalValidatorBalance
-            uint64(getStakingManager().initializationBlockNumber()),  // updateStartBlock = updateEndBlock
-            0,  // cumulativeProcessedDepositAmount
-            0,  // currentNumValidatorsNotWithdrawable
-            0,  // cumulativeNumValidatorsWithdrawable
-            0,  // windowWithdrawnPrincipalAmount
-            0,  // windowWithdrawnRewardAmount
-            0   // 其他字段
-        ),
-        msg.sender,
-        msg.sender,
-        0,
-        0
+        OracleRecord({
+            currentTotalValidatorBalance: 0,
+            updateEndBlock: uint64(getStakingManager().initializationBlockNumber()),
+            cumulativeProcessedDepositAmount: 0,
+            currentNumValidatorsNotWithdrawable: 0,
+            cumulativeNumValidatorsWithdrawable: 0,
+            windowWithdrawnPrincipalAmount: 0,
+            windowWithdrawnRewardAmount: 0,
+            updateStartBlock: 0
+        }),
+        msg.sender,  // bridge
+        msg.sender,  // l2Strategy
+        0,           // sourceChainId
+        0            // destChainId
     );
 }
 ```
+
+**注意**:
+- 初始记录的 `updateStartBlock` 为 0
+- `updateEndBlock` 设置为 StakingManager 的初始化区块号
+- 所有余额和验证者数量字段都为 0
 
 ---
 

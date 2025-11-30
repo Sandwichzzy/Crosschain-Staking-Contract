@@ -313,12 +313,15 @@ abstract contract TokenBridgeBase is
         if (!IsSupportChainId(sourceChainId)) {
             revert ChainIdIsNotSupported(sourceChainId);
         }
+//        转移 ETH 到目标地址 (StakingManager)
         (bool _ret, ) = payable(to).call{value: amount}("");
         if (!_ret) {
             revert TransferETHFailed();
         }
+        //减少资金池余额
         FundingPoolBalance[ContractsAddress.ETHAddress] -= amount;
 
+        //调用 MessageManager 标记消息已认领
         messageManager.claimMessage(
             sourceChainId,
             destChainId,

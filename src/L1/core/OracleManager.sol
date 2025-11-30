@@ -127,14 +127,14 @@ contract OracleManager is L1Base, IOracleManager {
         if (hasPendingUpdate) {
             revert CannotUpdateWhileUpdatePending();
         }
-
+        // 完整性验证
         validateUpdate(_records.length - 1, newRecord);
         //Finalize区块检查，每次提交收益记录，检测对应取款是否是Finalized,防止收益被回滚
         uint256 updateFinalizingBlock = newRecord.updateEndBlock + finalizationBlockNumberDelta;
         if (block.number < updateFinalizingBlock) {
             revert UpdateEndBlockNumberNotFinal(updateFinalizingBlock);
         }
-
+        //合理性检查
         (string memory rejectionReason, uint256 value, uint256 bound) = sanityCheckUpdate(latestRecord(), newRecord);
         if (bytes(rejectionReason).length > 0) {
             _pendingUpdate = newRecord;
@@ -150,6 +150,7 @@ contract OracleManager is L1Base, IOracleManager {
             IL1Pauser(getLocator().pauser()).pauseAll();
             return;
         }
+        // 验证通过,添加记录并处理收益
         _pushRecord(newRecord, bridge, l2Strategy, sourceChainId, destChainId);
     }
 
@@ -212,16 +213,17 @@ contract OracleManager is L1Base, IOracleManager {
     /// @param newRecord 新记录
     function validateUpdate(uint256 prevRecordIndex, OracleRecord calldata newRecord) public view {
         OracleRecord storage prevRecord = _records[prevRecordIndex];
+        // 检查 1: 区块范围有效
         if (newRecord.updateEndBlock <= newRecord.updateStartBlock) {
             revert InvalidUpdateEndBeforeStartBlock(newRecord.updateEndBlock, newRecord.updateStartBlock);
         }
 
-        // 确保预言机记录对齐，即确保新记录窗口从前一条记录结束的地方继续
+        // 检查 2: 区块连续性
         if (newRecord.updateStartBlock != prevRecord.updateEndBlock + 1) {
             revert InvalidUpdateStartBlock(prevRecord.updateEndBlock + 1, newRecord.updateStartBlock);
         }
 
-        // 确保链下预言机只跟踪来自协议的存款。共识层上已处理的存款最多为协议已存入存款合约的以太币数量
+        // 检查 3: 存款金额不能超过协议已存入
         if (newRecord.cumulativeProcessedDepositAmount > getStakingManager().totalDepositedInValidators()) {
             revert InvalidUpdateMoreDepositsProcessedThanSent(
                 newRecord.cumulativeProcessedDepositAmount, getStakingManager().totalDepositedInValidators()
@@ -252,12 +254,12 @@ contract OracleManager is L1Base, IOracleManager {
     returns (string memory, uint256, uint256)
     {
         uint64 reportSize = newRecord.updateEndBlock - newRecord.updateStartBlock + 1;
-        {
+        {   //检查 1: 报告区块数 ≥ 最小值
             if (reportSize < minReportSizeBlocks) {
                 return ("Report blocks below minimum bound", reportSize, minReportSizeBlocks);
             }
         }
-        {
+        {   // 检查 2: 可提款验证者数量只增不减
             if (newRecord.cumulativeNumValidatorsWithdrawable < prevRecord.cumulativeNumValidatorsWithdrawable) {
                 return (
                     "Cumulative number of withdrawable validators decreased",
