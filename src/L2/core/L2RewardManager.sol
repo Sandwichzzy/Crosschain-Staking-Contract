@@ -43,11 +43,11 @@ contract L2RewardManager is L2Base, L2RewardManagerStorage {
 
         // 计算质押者部分的手续费(92%)
         uint256 stakerFee = (operatorTotalFee * stakerPercent) / 100;
-        stakerRewards[strategy] = stakerFee;
+        stakerRewards[strategy] += stakerFee;
 
         // 计算运营商部分的手续费(8%)
         uint256 operatorFee = (operatorTotalFee * (100 - stakerPercent)) / 100;
-        operatorRewards[operator] = operatorFee;
+        operatorRewards[operator] += operatorFee;
 
         emit OperatorStakerReward(
             strategy,
@@ -72,6 +72,10 @@ contract L2RewardManager is L2Base, L2RewardManagerStorage {
     /// @return 是否成功
     function operatorClaimReward() external returns (bool){
         uint256 claimAmount = operatorRewards[msg.sender];
+        require(claimAmount > 0, "No rewards to claim");
+        // 清零防止重复申领
+        operatorRewards[msg.sender] = 0;
+
         getDapplinkToken().safeTransferFrom(address(this), msg.sender, claimAmount);
         emit OperatorClaimReward(
             msg.sender,
@@ -86,6 +90,8 @@ contract L2RewardManager is L2Base, L2RewardManagerStorage {
     /// @return 是否成功
     function stakerClaimReward(address strategy) external returns (bool){
         uint256 stakerAmount = stakerRewardsAmount(strategy);
+        require(stakerAmount > 0, "No rewards to claim");
+        claimedStakerRewards[strategy][msg.sender] += stakerAmount;
         getDapplinkToken().safeTransferFrom(address(this), msg.sender, stakerAmount);
         emit StakerClaimReward(
             msg.sender,

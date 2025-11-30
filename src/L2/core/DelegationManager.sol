@@ -121,6 +121,7 @@ contract DelegationManager is L2Base, DelegationManagerStorage {
         emit StakerUndelegated(staker, operator);
         delegatedTo[staker] = address(0);        //将staker和operator之间的委托关系移除
 
+        // 为每个策略创建单独的提款队列
         if (strategies.length == 0) {
             withdrawalRoots = new bytes32[](0);
         } else {
