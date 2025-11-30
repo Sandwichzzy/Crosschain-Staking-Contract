@@ -39,14 +39,14 @@ contract L2RewardManager is L2Base, L2RewardManagerStorage {
         // 获取运营商在该策略中的份额
         uint256 operatorShares = getDelegationManager().operatorShares(operator, strategy);
         // 计算运营商应得的总手续费: baseFee * (运营商份额 / 策略总份额)
-        uint256 operatorTotalFee = baseFee / (operatorShares / totalShares);
+        uint256 operatorTotalFee = (baseFee * operatorShares) / totalShares;
 
         // 计算质押者部分的手续费(92%)
-        uint256 stakerFee = operatorTotalFee * (stakerPercent / 100);
+        uint256 stakerFee = (operatorTotalFee * stakerPercent) / 100;
         stakerRewards[strategy] = stakerFee;
 
         // 计算运营商部分的手续费(8%)
-        uint256 operatorFee = operatorTotalFee * ((100 - stakerPercent) / 100);
+        uint256 operatorFee = (operatorTotalFee * (100 - stakerPercent)) / 100;
         operatorRewards[operator] = operatorFee;
 
         emit OperatorStakerReward(
@@ -108,7 +108,7 @@ contract L2RewardManager is L2Base, L2RewardManagerStorage {
             return 0;
         }
         // 按比例计算奖励: 策略总奖励 * (质押者份额 / 策略总份额)
-        return stakerRewards[strategy] * (stakerShare /  strategyShares);
+        return (stakerRewards[strategy] * stakerShare) / strategyShares;
     }
 
     /// @notice 更新运营商和质押者的收益分配比例

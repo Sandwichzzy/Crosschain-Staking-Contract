@@ -230,6 +230,7 @@ contract OracleManager is L1Base, IOracleManager {
             );
         }
 
+        // 检查 4: 验证者数量不能超过已启动数量
         if (
             uint256(newRecord.currentNumValidatorsNotWithdrawable)
             + uint256(newRecord.cumulativeNumValidatorsWithdrawable) > getStakingManager().numInitiatedValidators()
@@ -267,6 +268,7 @@ contract OracleManager is L1Base, IOracleManager {
                     prevRecord.cumulativeNumValidatorsWithdrawable
                 );
             }
+            // 检查 3: 总验证者数量只增不减
             {
                 uint256 prevNumValidators =
                     prevRecord.currentNumValidatorsNotWithdrawable + prevRecord.cumulativeNumValidatorsWithdrawable;
@@ -280,6 +282,7 @@ contract OracleManager is L1Base, IOracleManager {
         }
 
         {
+            // 检查 4: 已处理存款金额只增不减
             if (newRecord.cumulativeProcessedDepositAmount < prevRecord.cumulativeProcessedDepositAmount) {
                 return (
                     "Processed deposit amount decreased",
@@ -288,6 +291,7 @@ contract OracleManager is L1Base, IOracleManager {
                 );
             }
 
+            // 检查 5: 每个新验证者的存款金额在合理范围 [minDepositPerValidator, maxDepositPerValidator]
             uint256 newDeposits =
             (newRecord.cumulativeProcessedDepositAmount - prevRecord.cumulativeProcessedDepositAmount);
             uint256 newValidators = (
@@ -309,6 +313,7 @@ contract OracleManager is L1Base, IOracleManager {
         }
 
         {
+            // 检查 6: 共识层余额变化在合理范围
             uint256 baselineGrossCLBalance = prevRecord.currentTotalValidatorBalance
                 + (newRecord.cumulativeProcessedDepositAmount - prevRecord.cumulativeProcessedDepositAmount);
 
@@ -316,6 +321,7 @@ contract OracleManager is L1Base, IOracleManager {
                 + newRecord.windowWithdrawnPrincipalAmount + newRecord.windowWithdrawnRewardAmount;
 
             {
+                // 下限 = 基线 - 最大损失 + 最小增益
                 uint256 lowerBound = baselineGrossCLBalance
                     - Math.mulDiv(maxConsensusLayerLossPPM, baselineGrossCLBalance, _PPM_DENOMINATOR)
                     + Math.mulDiv(minConsensusLayerGainPerBlockPPT * reportSize, baselineGrossCLBalance, _PPT_DENOMINATOR);
@@ -325,6 +331,7 @@ contract OracleManager is L1Base, IOracleManager {
                 }
             }
             {
+                // 上限 = 基线 + 最大增益
                 uint256 upperBound = baselineGrossCLBalance
                     + Math.mulDiv(maxConsensusLayerGainPerBlockPPT * reportSize, baselineGrossCLBalance, _PPT_DENOMINATOR);
 

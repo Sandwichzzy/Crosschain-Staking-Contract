@@ -442,7 +442,7 @@ function sanityCheckUpdate(
 
 **合约**: `ReturnsAggregator.sol`
 **函数**: `processReturns(...)`
-**文件位置**: `src/L1/core/ReturnsAggregator.sol`
+**文件位置**: `src/L1/core/ReturnsAggregator.sol:51`
 
 ```solidity
 function processReturns(
@@ -453,99 +453,148 @@ function processReturns(
     address l2Strategy,                // L2 策略地址
     uint256 sourceChainId,             // 源链 ID
     uint256 destChainId                // 目标链 ID
-) external onlyOracleManager {
-    uint256 elReturnsToProcess = 0;
+) external assertBalanceUnchanged {
+    // 0. 权限检查
+    if (msg.sender != getLocator().oracleManager()) {
+        revert NotOracle();
+    }
 
-    // 1. 处理 EL 奖励(如果需要)
+    // 1. 计算将聚合的收益总额
+    uint256 clTotal = rewardAmount + principalAmount;  // CL 总额 = 奖励 + 本金
+    uint256 totalRewards = rewardAmount;               // 总奖励(用于计算费用)
+
+    uint256 elRewards = 0;
     if (shouldIncludeELRewards) {
-        address elReceiver = getLocator().executionLayerReceiver();
-        elReturnsToProcess = elReceiver.balance;
-        if (elReturnsToProcess > 0) {
-            // 转移 EL 奖励到 ReturnsAggregator
-            (bool success,) = address(this).call{value: elReturnsToProcess}("");
-            require(success, "EL transfer failed");
-        }
+        elRewards = getLocator().executionLayerReceiver().balance;
+        totalRewards += elRewards;  // 总奖励包含 EL 奖励
     }
 
-    // 2. 计算总收益和协议费用
-    uint256 totalReturns = rewardAmount + elReturnsToProcess;
-    uint256 protocolFee = Math.mulDiv(totalReturns, feesBasisPoints, 10000);  // 默认 10%
-    uint256 netReturns = totalReturns - protocolFee;
+    // 2. 计算协议费用(仅对奖励收费,不对本金收费)
+    uint256 fees = Math.mulDiv(feesBasisPoints, totalRewards, _BASIS_POINTS_DENOMINATOR);
 
-    protocolFeesAccrued += protocolFee;
-
-    // 3. 计算 CL 净收益和 EL 净收益
-    uint256 clFee = Math.mulDiv(rewardAmount, feesBasisPoints, 10000);
-    uint256 clNetReturns = rewardAmount - clFee;
-
-    uint256 elFee = Math.mulDiv(elReturnsToProcess, feesBasisPoints, 10000);
-    uint256 elNetReturns = elReturnsToProcess - elFee;
-
-    // 4. CL 净收益转入 StakingManager
-    if (clNetReturns > 0) {
-        address stakingManager = getLocator().stakingManager();
-        (bool success,) = stakingManager.call{value: clNetReturns}("");
-        require(success, "CL transfer failed");
+    // 3. 桥接 EL 奖励到 L2
+    if (elRewards > 0) {
+        bool success = SafeCall.callWithMinGas(
+            bridge,
+            gasLimit,
+            elRewards,
+            abi.encodeWithSignature("BridgeInitiateETH(uint256,uint256,address)", sourceChainId, destChainId, l2Strategy)
+        );
+        require(success, "BridgeInitiateETH failed");
     }
 
-    // 5. EL 净收益桥接到 L2
-    if (elNetReturns > 0) {
-        ITokenBridgeBase(bridge).BridgeInitiateETH{value: elNetReturns}(
-            getLocator().l1RewardManager(),  // L2 的 L1RewardManager 地址
-            elNetReturns,
-            sourceChainId,
-            destChainId
+    // 4. 从 CL Receiver 转移 CL 总额到本合约
+    if (clTotal > 0) {
+        ReturnsReceiver(payable(getLocator().consensusLayerReceiver())).transfer(
+            payable(address(this)),
+            clTotal
         );
     }
 
-    // 6. 处理本金(如果有验证者退出)
-    if (principalAmount > 0) {
-        address stakingManager = getLocator().stakingManager();
-        (bool success,) = stakingManager.call{value: principalAmount}("");
-        require(success, "Principal transfer failed");
+    // 5. 计算净收益并转发到 StakingManager
+    // 净收益 = CL总额 + EL奖励 - 费用
+    uint256 netReturns = clTotal + elRewards - fees;
+    if (netReturns > 0) {
+        IStakingManagerReturnsWrite(getLocator().stakingManager()).receiveReturns{value: netReturns}();
     }
 
-    emit ReturnsProcessed(totalReturns, protocolFee, clNetReturns, elNetReturns);
+    // 6. 发送协议费用到费用接收钱包
+    if (fees > 0) {
+        emit FeesCollected(fees);
+        Address.sendValue(feesReceiver, fees);
+    }
 }
 ```
+
+**关键逻辑说明**:
+
+1. **费用计算**: 只对**奖励**收费(`totalRewards = rewardAmount + elRewards`),不对本金收费
+2. **EL 奖励处理**: EL 奖励直接桥接到 L2,**不经过** ReturnsAggregator
+3. **CL 处理**: CL 奖励 + 本金先转到 ReturnsAggregator,扣除费用后转入 StakingManager
+4. **净收益公式**: `netReturns = clTotal + elRewards - fees`
+   - 注意: 虽然 `elRewards` 已桥接,但计算中仍包含以确保余额不变
+5. **余额不变断言**: `assertBalanceUnchanged` 修饰符确保函数执行后合约余额为 0
 
 **收益分配示例**:
 
 ```
 假设:
 - CL 奖励 (rewardAmount) = 1 ETH
-- EL 奖励 (elReturnsToProcess) = 0.5 ETH
+- CL 本金 (principalAmount) = 0 ETH
+- EL 奖励 (elRewards) = 0.5 ETH
 - 协议费率 (feesBasisPoints) = 1000 (10%)
 
 计算:
-- 总收益 = 1 + 0.5 = 1.5 ETH
-- 协议费用 = 1.5 * 10% = 0.15 ETH
-- 净收益 = 1.5 - 0.15 = 1.35 ETH
+- clTotal = 1 + 0 = 1 ETH
+- totalRewards = 1 + 0.5 = 1.5 ETH (用于计算费用)
+- fees = 1.5 * 10% = 0.15 ETH
 
-分配:
-- CL 费用 = 1 * 10% = 0.1 ETH
-- CL 净收益 = 1 - 0.1 = 0.9 ETH → StakingManager
-- EL 费用 = 0.5 * 10% = 0.05 ETH
-- EL 净收益 = 0.5 - 0.05 = 0.45 ETH → 桥接到 L2
+分配流程:
+1. EL 奖励 0.5 ETH → 桥接到 L2
+2. CL 总额 1 ETH → 从 CL Receiver 转到 ReturnsAggregator
+3. netReturns = 1 + 0.5 - 0.15 = 1.35 ETH → StakingManager
+4. fees = 0.15 ETH → feesReceiver
 
 结果:
-- 协议费用累计: 0.15 ETH
-- StakingManager 收到: 0.9 ETH (提高 dETH 汇率)
-- L2 L1RewardManager 收到: 0.45 ETH (用户按份额申领)
+- feesReceiver 收到: 0.15 ETH
+- StakingManager 收到: 1.35 ETH (提高 dETH 汇率)
+- L2 Bridge 收到: 0.5 ETH (桥接中)
+
+注意:
+- EL 奖励虽然已桥接,但在 netReturns 计算中仍被计入
+- 这是为了满足 assertBalanceUnchanged 断言:
+  收入(clTotal) = 支出(netReturns + fees - elRewards)
+  1 = 1.35 + 0.15 - 0.5 ✓
 ```
 
 ---
 
 #### 步骤 8-11: EL 收益桥接到 L2
 
+**关键差异**: 在实际代码中,EL 收益桥接**在步骤 3**已经完成,而不是单独的步骤。
+
 **流程**:
-1. `ReturnsAggregator` 调用 `L1Bridge.BridgeInitiateETH(L1RewardManager地址, elNetReturns)`
-2. L1 桥接合约存储跨链消息并触发事件
-3. Relayer 监听事件,调用 `L2Bridge.claimMessage(messageHash, proof)`
-4. L2 桥接合约验证消息,调用 `L1RewardManager.depositETHRewardTo{value: elNetReturns}()`
+1. `ReturnsAggregator.processReturns()` 中直接调用桥接:
+   ```solidity
+   // ReturnsAggregator.sol:77
+   bool success = SafeCall.callWithMinGas(
+       bridge,
+       gasLimit,
+       elRewards,  // 发送 EL 奖励金额
+       abi.encodeWithSignature(
+           "BridgeInitiateETH(uint256,uint256,address)",
+           sourceChainId,
+           destChainId,
+           l2Strategy  // L2 端的接收地址
+       )
+   );
+   ```
+
+2. L1 桥接合约 `TokenBridgeBase.BridgeInitiateETH()` 处理:
+   ```solidity
+   // TokenBridgeBase.sol:149
+   function BridgeInitiateETH(
+       uint256 sourceChainId,
+       uint256 destChainId,
+       address to
+   ) external payable returns (bool) {
+       // 验证链 ID
+       if (sourceChainId != block.chainid) {
+           revert InvalidSourceChainId();
+       }
+       // 存储跨链消息
+       // 触发事件供 Relayer 监听
+       ...
+   }
+   ```
+
+3. Relayer 监听事件并中继到 L2 (与文档描述一致)
+
+4. L2 端处理 (需要检查实际实现)
 
 **状态变化**:
-- `L1RewardManager.L1RewardBalance` 增加 `elNetReturns`
+- EL 奖励直接从 `executionLayerReceiver` 的余额通过桥接转移
+- **重要**: EL Receiver 的余额在桥接调用中通过 `msg.value` 发送,而不是先转到 ReturnsAggregator
 
 ---
 
@@ -773,42 +822,63 @@ function calculateFee(address strategy, address operator, uint256 baseFee) exter
 
 **⚠️ 代码问题分析**:
 
-原代码存在严重的整数除法精度问题:
+实际代码已修正了原文档中描述的整数除法问题,但引入了新的问题:
 
 ```solidity
-// 问题 1: operatorShares / totalShares 会先计算,结果可能为 0
-uint256 operatorTotalFee = baseFee / (operatorShares / totalShares);
-
-// 问题 2: stakerPercent / 100 会先计算,结果为 0 (因为 stakerPercent = 92 < 100)
-uint256 stakerFee = operatorTotalFee * (stakerPercent / 100);
-
-// 问题 3: (100 - stakerPercent) / 100 同样为 0
-uint256 operatorFee = operatorTotalFee * ((100 - stakerPercent) / 100);
+// 问题 1: 直接赋值会覆盖之前的奖励记录
+stakerRewards[strategy] = stakerFee;      // ❌ 每次调用都覆盖
+operatorRewards[operator] = operatorFee;  // ❌ 每次调用都覆盖
 ```
+
+**问题影响**:
+1. **多次调用丢失奖励**: 如果对同一个 `strategy` 或 `operator` 多次调用 `calculateFee()`,之前的奖励会被覆盖
+2. **多运营商场景问题**: 一个策略可能有多个运营商,后调用的会覆盖前面的奖励分配
+3. **无法追踪历史**: 无法知道某个策略或运营商累计应得多少奖励
 
 **建议修改**:
 
+有两种解决方案:
+
+**方案 1: 使用累加** (如果允许多次分配)
 ```solidity
-function calculateFee(address strategy, address operator, uint256 baseFee) external {
-    uint256 totalShares = getStrategy(strategy).totalShares();
-    uint256 operatorShares = getDelegationManager().operatorShares(operator, strategy);
+stakerRewards[strategy] += stakerFee;     // 累加奖励
+operatorRewards[operator] += operatorFee; // 累加奖励
+```
 
-    // 修正: 计算运营商总手续费 = baseFee * (operatorShares / totalShares)
-    uint256 operatorTotalFee = (baseFee * operatorShares) / totalShares;
+**方案 2: 添加已申领记录** (当前设计下更合理)
+```solidity
+// 添加映射跟踪已申领金额
+mapping(address => mapping(address => uint256)) public claimedStakerRewards;  // strategy => staker => claimed
+mapping(address => uint256) public claimedOperatorRewards;  // operator => claimed
 
-    // 修正: 质押者部分 = operatorTotalFee * 92 / 100
-    uint256 stakerFee = (operatorTotalFee * stakerPercent) / 100;
-    stakerRewards[strategy] += stakerFee;  // 累加,不是覆盖
+// 在 stakerClaimReward 中:
+function stakerClaimReward(address strategy) external returns (bool) {
+    uint256 stakerAmount = stakerRewardsAmount(strategy);
+    require(stakerAmount > 0, "No rewards to claim");
 
-    // 修正: 运营商部分 = operatorTotalFee * 8 / 100
-    uint256 operatorFee = (operatorTotalFee * (100 - stakerPercent)) / 100;
-    operatorRewards[operator] += operatorFee;  // 累加,不是覆盖
+    // 记录已申领金额
+    claimedStakerRewards[strategy][msg.sender] += stakerAmount;
 
-    emit OperatorStakerReward(strategy, operator, stakerFee, operatorFee);
+    getDapplinkToken().safeTransferFrom(address(this), msg.sender, stakerAmount);
+    emit StakerClaimReward(msg.sender, stakerAmount);
+    return true;
+}
+
+// 在 operatorClaimReward 中:
+function operatorClaimReward() external returns (bool) {
+    uint256 claimAmount = operatorRewards[msg.sender];
+    require(claimAmount > 0, "No rewards to claim");
+
+    // 清零防止重复申领
+    operatorRewards[msg.sender] = 0;
+
+    getDapplinkToken().safeTransferFrom(address(this), msg.sender, claimAmount);
+    emit OperatorClaimReward(msg.sender, claimAmount);
+    return true;
 }
 ```
 
-**分配示例** (修正后):
+**分配示例**:
 
 ```
 假设:
@@ -862,7 +932,7 @@ function stakerRewardsAmount(address strategy) public view returns (uint256) {
     }
 
     // 按比例计算奖励
-    return stakerRewards[strategy] * (stakerShare / strategyShares);
+    return stakerRewards[strategy] * (stakerShare / strategyShares);  // ⚠️ 整数除法问题
 }
 ```
 
@@ -1541,14 +1611,19 @@ if (newGrossCLBalance < lowerBound) {
 
 ### 代码问题汇总
 
-| 问题 | 位置 | 严重性 | 影响 |
-|------|------|--------|------|
-| 整数除法精度损失 | L1RewardManager.stakerRewardsAmount | 高 | 小额奖励被四舍五入为 0 |
-| 整数除法精度损失 | L2RewardManager.calculateFee | 高 | 手续费计算错误,可能全部为 0 |
-| 整数除法精度损失 | L2RewardManager.stakerRewardsAmount | 高 | 小额奖励被四舍五入为 0 |
-| 缺少重复申领保护 | L2RewardManager.operatorClaimReward | 高 | 运营商可以重复申领奖励 |
-| 缺少申领记录 | L2RewardManager.stakerClaimReward | 高 | 质押者可以重复申领奖励 |
-| 未申领奖励锁定 | L1RewardManager | 中 | 如果所有用户解质押,ETH 被锁定 |
+| 问题 | 位置 | 严重性 | 实际状态 | 影响 |
+|------|------|--------|----------|------|
+| 整数除法精度损失 | L2RewardManager.stakerRewardsAmount:111 | 高 | ❌ 存在 | 小额奖励被四舍五入为 0 |
+| 奖励覆盖问题 | L2RewardManager.calculateFee:46,50 | 高 | ❌ 存在 | 多次调用会覆盖之前的奖励记录 |
+| 缺少重复申领保护 | L2RewardManager.operatorClaimReward:73 | 高 | ❌ 存在 | 运营商可以重复申领奖励 |
+| 缺少申领记录 | L2RewardManager.stakerClaimReward:87 | 中 | ❌ 存在 | 质押者可能重复申领 |
+| 未申领奖励锁定 | L1RewardManager | 中 | ⚠️ 设计问题 | 如果所有用户解质押,ETH 被锁定 |
+
+**修正状态**:
+- ✅ `calculateFee` 的整数除法问题已在实际代码中修正
+- ❌ `stakerRewardsAmount` 仍存在整数除法精度问题
+- ❌ 使用赋值(`=`)而非累加(`+=`),可能导致奖励覆盖
+- ❌ 缺少重复申领保护机制
 
 ### 相关文档
 
