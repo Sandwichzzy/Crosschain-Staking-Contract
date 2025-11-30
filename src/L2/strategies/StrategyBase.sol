@@ -139,7 +139,7 @@ contract StrategyBase is Initializable, IStrategy {
         uint256 amountToSend = (virtualTokenBalance * amountShares) / virtualPriorTotalShares;
 
         totalShares = priorTotalShares - amountShares;
-
+        // 5. 转账并更新 L1BackShares
         _afterWithdrawal(recipient, weth, amountToSend);
     }
 
@@ -171,7 +171,7 @@ contract StrategyBase is Initializable, IStrategy {
             weth.safeTransfer(recipient, amountToSend);
             virtualWethBalance -= amountToSend;
         }
-        // Reduce shares in stakerStrategyL1BackShares
+        //  减少 L1BackShares
         strategyManager.updateStakerStrategyL1BackShares(recipient, address(this), amountToSend);
     }
 

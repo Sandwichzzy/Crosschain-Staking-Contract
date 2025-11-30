@@ -308,15 +308,18 @@ contract DelegationManager is L2Base, DelegationManagerStorage {
             "DelegationManager._completeQueuedWithdrawal: only withdrawer can complete action"
         );
 
+//        删除待处理标记
         delete pendingWithdrawals[withdrawalRoot];
         address currentOperator = delegatedTo[msg.sender];
         if (receiveAsWeth) {
+            // 选项 A: 提取为 WETH
             for (uint256 i = 0; i < withdrawal.strategies.length;) {
+                // 检查延迟期
                 require(
                     withdrawal.startBlock + strategyWithdrawalDelayBlocks[withdrawal.strategies[i]] <= block.number,
                     "DelegationManager._completeQueuedWithdrawal: withdrawalDelayBlocks period has not yet passed for this strategy"
                 );
-
+                // 调用 StrategyManager 提取为 WETH
                 _withdrawSharesAsWeth({
                     withdrawer: msg.sender, strategy: withdrawal.strategies[i], shares: withdrawal.shares[i], weth: weth
                 });
@@ -326,12 +329,15 @@ contract DelegationManager is L2Base, DelegationManagerStorage {
                 emit WithdrawalCompleted(currentOperator, msg.sender, withdrawal.strategies[i], withdrawal.shares[i]);
             }
         } else {
+            // 选项 B: 重新质押 (恢复份额)
             for (uint256 i = 0; i < withdrawal.strategies.length;) {
                 // require(
                 //     withdrawal.startBlock + strategyWithdrawalDelayBlocks[withdrawal.strategies[i]] <= block.number,
                 //     "DelegationManager._completeQueuedWithdrawal: withdrawalDelayBlocks period has not yet passed for this strategy"
                 // );
+                // 恢复 StrategyManager 中的份额
                 getStrategyManager().addShares(msg.sender, weth, withdrawal.strategies[i], withdrawal.shares[i]);
+                // 如果当前已委托,恢复运营商份额
                 if (currentOperator != address(0)) {
                     _increaseOperatorShares({
                         operator: currentOperator,
@@ -372,8 +378,11 @@ contract DelegationManager is L2Base, DelegationManagerStorage {
             staker != address(0), "DelegationManager._removeSharesAndQueueWithdrawal: staker cannot be zero address"
         );
         require(strategies.length != 0, "DelegationManager._removeSharesAndQueueWithdrawal: strategies cannot be empty");
+        // 1. 遍历策略,移除份额
         for (uint256 i = 0; i < strategies.length;) {
+            //检查 L1 返还的份额 防止用户提取尚未从 L1 迁移的份额
             uint256 l1BackShares = getStrategyManager().getStakerStrategyL1BackShares(staker, strategies[i]);
+            // 只有 l1BackShares >= shares[i] 时才处理
             if (l1BackShares >= shares[i]) {
                 if (operator != address(0)) {
                     _decreaseOperatorShares({
@@ -384,6 +393,7 @@ contract DelegationManager is L2Base, DelegationManagerStorage {
                     staker == withdrawer || !getStrategyManager().thirdPartyTransfersForbidden(strategies[i]),
                     "DelegationManager._removeSharesAndQueueWithdrawal: withdrawer must be same address as staker if thirdPartyTransfersForbidden are set"
                 );
+                // 调用 StrategyManager 移除staker份额
                 getStrategyManager().removeShares(staker, strategies[i], shares[i]);
 
                 unchecked {
@@ -391,10 +401,10 @@ contract DelegationManager is L2Base, DelegationManagerStorage {
                 }
             }
         }
-
+        // 2. 生成 nonce 并递增
         uint256 nonce = cumulativeWithdrawalsQueued[staker];
         cumulativeWithdrawalsQueued[staker]++;
-
+        // 3. 创建 Withdrawal 对象
         Withdrawal memory withdrawal = Withdrawal({
             staker: staker,
             delegatedTo: operator,

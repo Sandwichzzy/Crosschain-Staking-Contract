@@ -163,8 +163,8 @@ contract StakingManager is L1Base, IStakingManager {
     /// @notice 通过将相应的 dETH 转移到质押合约并在解除质押请求管理器上创建请求来处理用户的解除质押请求。
     /// @param dethAmount 要解除质押的 dETH 数量。
     /// @param minETHAmount 用户期望获得的最小 ETH 数量。
-    /// @param l2Strategy L2 上的策略合约地址
-    /// @param destChainId 目标链 ID
+    /// @param l2Strategy L2 上的策略合约地址 用于聚合请求
+    /// @param destChainId 目标链 ID (L2 链 ID) 用于聚合请求
     function _unstakeRequest(uint128 dethAmount, uint128 minETHAmount, address l2Strategy, uint256 destChainId) internal {
         if (getL1Pauser().isUnstakeRequestsAndClaimsPaused()) {
             revert Paused();
@@ -175,16 +175,18 @@ contract StakingManager is L1Base, IStakingManager {
         }
 
         uint128 ethAmount = uint128(dETHToETH(dethAmount));
+        //滑点保护: 检查 ETH 数量是否满足最小值
         if (ethAmount < minETHAmount) {
             revert UnstakeBelowMinimudETHAmount(ethAmount, minETHAmount);
         }
-
+        //调用 UnstakeRequestsManager 创建请求
         getUnstakeRequestsManager().create({requester: msg.sender, l2Strategy: l2Strategy, dETHLocked: dethAmount, ethRequested: ethAmount, destChainId: destChainId});
-
+        // 用于关联请求
         unStakeMessageNonce++;
 
         emit UnstakeRequested({staker: msg.sender, l2Strategy: l2Strategy, ethAmount: ethAmount, dETHLocked: dethAmount, destChainId: destChainId, unStakeMessageNonce: unStakeMessageNonce});
 
+        //转移 dETH 到 UnstakeRequestsManager
         SafeERC20.safeTransferFrom(getDETH(), msg.sender, getLocator().unStakingRequestsManager(), dethAmount);
     }
 

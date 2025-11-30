@@ -76,7 +76,7 @@ contract UnstakeRequestsManager is
         numberOfBlocksToFinalize = init.numberOfBlocksToFinalize;
     }
 
-    /// @notice 创建解质押请求
+    /// @notice 创建解质押请求 (聚合模式)
     /// @dev 仅质押合约可调用,记录用户的解质押请求信息
     /// @param requester 请求者地址
     /// @param l2Strategy L2 策略合约地址
@@ -87,13 +87,16 @@ contract UnstakeRequestsManager is
         external
         onlyStakingContract
     {
+        //计算累计请求的 ETH
         uint256 currentCumulativeETHRequested = latestCumulativeETHRequested + ethRequested;
-
+        //聚合请求: 按 (destChainId, l2Strategy) 累加
         l2ChainStrategyAmount[destChainId][l2Strategy] += ethRequested;
         dEthLockedAmount[destChainId][l2Strategy] += dETHLocked;
+        //更新区块号 (覆盖)
         l2ChainStrategyBlockNumber[destChainId][l2Strategy] = block.number;
+        //记录累计 ETH
         currentRequestedCumulativeETH[destChainId][l2Strategy] = currentCumulativeETHRequested;
-
+        //更新全局累计
         latestCumulativeETHRequested = currentCumulativeETHRequested;
 
         emit UnstakeRequestCreated(
@@ -113,7 +116,7 @@ contract UnstakeRequestsManager is
         }
 
         for (uint256 i = 0; i < requests.length; i++) {
-            address requester = requests[i].requestAddress;
+            address requester = requests[i].requestAddress; // 实际是 l2Strategy
             uint256 unStakeMessageNonce  = requests[i].unStakeMessageNonce;
             _claim(requester, unStakeMessageNonce, sourceChainId, destChainId, gasLimit);
         }
@@ -127,11 +130,12 @@ contract UnstakeRequestsManager is
     /// @param destChainId 目标链 ID
     /// @param gasLimit 桥接交易的 Gas 限制
     function _claim(address requester, uint256 unStakeMessageNonce, uint256 sourceChainId, uint256 destChainId, uint256 gasLimit) private {
-
+        // 1. 读取聚合的请求数据
         uint256 csBlockNumber = l2ChainStrategyBlockNumber[destChainId][requester];
         uint256 ethRequested = l2ChainStrategyAmount[destChainId][requester];
         uint256 dETHLocked = dEthLockedAmount[destChainId][requester];
 
+        // 2. 删除请求数据 (一次性清空)
         delete l2ChainStrategyAmount[destChainId][requester];
         delete dEthLockedAmount[destChainId][requester];
         delete l2ChainStrategyBlockNumber[destChainId][requester];
@@ -141,6 +145,7 @@ contract UnstakeRequestsManager is
         //     revert NotFinalized();
         // }
 
+        // 3. 触发事件
         emit UnstakeRequestClaimed({
             l2strategy: requester,
             ethRequested: ethRequested,
@@ -150,7 +155,11 @@ contract UnstakeRequestsManager is
             bridgeAddress: getLocator().dapplinkBridge(),
             unStakeMessageNonce: unStakeMessageNonce
         });
+
+        // 4. 销毁 dETH (在申领时,不是创建请求时)
         getDETH().burn(dETHLocked);
+
+        // 5. 通过桥接发送 ETH 到 L2
         bool success = SafeCall.callWithMinGas(
             getLocator().dapplinkBridge(),
             gasLimit,
@@ -202,12 +211,15 @@ contract UnstakeRequestsManager is
         uint256 ethRequested = l2ChainStrategyAmount[destChainId][l2Strategy];
         uint256 dETHLocked = dEthLockedAmount[destChainId][l2Strategy];
         uint256 cumulativeETHRequested = currentRequestedCumulativeETH[destChainId][l2Strategy];
-
+        // 1. 检查是否已完成 (区块延迟)
         bool isFinalized = _isFinalized(csBlockNumber);
+        // 2. 计算可申领金额
         uint256 claimableAmount = 0;
-
+        // 计算此请求之前的所有累计请求
         uint256 allocatedEthRequired = cumulativeETHRequested - ethRequested;
+        // 如果已分配的 ETH 足够覆盖之前的请求
         if (allocatedEthRequired < allocatedETHForClaims) {
+            // 可申领金额 = min(剩余可用 ETH, 本请求的 ETH)
             claimableAmount = Math.min(allocatedETHForClaims - allocatedEthRequired,  ethRequested);
         }
         return (isFinalized, claimableAmount);
